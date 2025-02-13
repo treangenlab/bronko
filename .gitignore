@@ -1,5 +1,6 @@
 /target
 /.vscode
+/test_data
 
 # Added by cargo
 #
