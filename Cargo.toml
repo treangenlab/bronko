@@ -1,0 +1,16 @@
+[package]
+name = "intrahost_variants"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Ryan Doughty <rdd4@rice.edu>"
+]
+description = "Rapid Intrahost Variation Analyses Using Split K-mers"
+readme = "README.md"
+keywords = ["bioinformatics", "genomics", "sequencing", "k-mer", "viruses"]
+categories = ["command-line-utilities", "science"]
+
+[dependencies]
+clap = { version = "4.5.29", features = ["derive"] }
+log = "0.4.25"
+simple_logger = "5.0.0"
