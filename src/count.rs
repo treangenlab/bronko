@@ -1,16 +1,10 @@
-use log::*;
 use crate::cli::*;
 use crate::io::*;
+use crate::util::*;
 
-fn check_fastq(file: &str) -> bool{
-    if file.ends_with(".fq") || file.ends_with(".fastq") || file.ends_with(".fq.gz") || file.ends_with("fastq.gz") || file.ends_with("fnq") || file.ends_with("fnq.gz"){
-        return true;
-    }
-    return false;
-}
+use::log::*;
 
-fn check_args(args: &CountArgs){
-
+fn check_args(args: &CountArgs) {
     let output_level;
     if args.verbose {
         output_level = log::LevelFilter::Trace;
@@ -20,7 +14,10 @@ fn check_args(args: &CountArgs){
         output_level = log::LevelFilter::Info;
     }
 
-    simple_logger::SimpleLogger::new().with_level(output_level).init().unwrap();
+    simple_logger::SimpleLogger::new()
+        .with_level(output_level)
+        .init()
+        .unwrap();
 
     trace!("Test Trace");
     debug!("Test Debug");
@@ -33,16 +30,14 @@ fn check_args(args: &CountArgs){
     }
 
     //check to see if input is fastq file
-    if !check_fastq(&args.input){
+    if !check_fastq(&args.input) {
         error!("Input is not a fastq file (must be .fq(.gz)/.fastq(.gz)/.fnq(.gz))");
         std::process::exit(1)
     }
-
-
 }
 
-pub fn count(args: CountArgs){
-
+pub fn count(args: CountArgs) {
+    // check to make sure none of the
     check_args(&args);
 
     match read_fastq(&args.input) {
@@ -50,17 +45,15 @@ pub fn count(args: CountArgs){
             info!("There are {} reads in your file", n_reads);
             info!("There are {} bases in your file.", n_bases);
         }
-        Err(e) => {
-            match e {
-                FastqError::IoError(io_err) => {
-                    eprintln!("IO Error: {}", io_err);
-                    std::process::exit(1);
-                }
-                FastqError::ParseError(parse_err) => {
-                    eprintln!("Parse Error: {}", parse_err);
-                    std::process::exit(1);
-                }
+        Err(e) => match e {
+            FastxError::IoError(io_err) => {
+                error!("{}", io_err);
+                std::process::exit(1);
+            }
+            FastxError::ParseError(parse_err) => {
+                error!("Parse Error: {}", parse_err);
+                std::process::exit(1);
             }
         },
-    }    
+    }
 }

@@ -1,2 +1,2 @@
-pub const MIN_KMER_SIZE: u32 = 7;
-pub const DEFAULT_KMER_SIZE: u32 = 13;
+pub const MIN_KMER_SIZE: usize = 5;
+pub const DEFAULT_KMER_SIZE: usize = 13;
