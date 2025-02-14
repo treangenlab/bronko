@@ -2,7 +2,7 @@ use crate::cli::*;
 use crate::io::*;
 use crate::util::*;
 
-use::log::*;
+use ::log::*;
 
 fn check_args(args: &CountArgs) {
     let output_level;

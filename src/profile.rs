@@ -6,7 +6,7 @@ use needletail::{parse_fastx_file, Sequence};
 
 use std::collections::HashMap;
 
-fn check_args(args: &ProfileArgs){
+fn check_args(args: &ProfileArgs) {
     let output_level;
     if args.verbose {
         output_level = log::LevelFilter::Trace;
@@ -39,7 +39,6 @@ fn check_args(args: &ProfileArgs){
 }
 
 pub fn profile(args: ProfileArgs) {
-
     //check the arguments
     check_args(&args);
 
@@ -50,30 +49,29 @@ pub fn profile(args: ProfileArgs) {
     });
 
     // Some nice statistics to have
-    let mut n_reads:usize = 0;
-    let mut n_bases:usize = 0;
-    let mut n_kmers:usize = 0;
+    let mut n_reads: usize = 0;
+    let mut n_bases: usize = 0;
+    let mut n_kmers: usize = 0;
 
-    let mid: usize = &args.kmer/2; //for finding the split kmer
+    let mid: usize = &args.kmer / 2; //for finding the split kmer
 
     let mut skmers: HashMap<Vec<u8>, [u32; 4]> = HashMap::new();
 
     trace!("Building the skmer hashmap");
     while let Some(record) = reader.next() {
-        let seqrec =
-            record.unwrap_or_else(|e| {
-                error!("Invalid record in {}: {}", &args.input, e);
-                std::process::exit(1);
-            });
-        
+        let seqrec = record.unwrap_or_else(|e| {
+            error!("Invalid record in {}: {}", &args.input, e);
+            std::process::exit(1);
+        });
+
         let norm_seq = seqrec.normalize(false);
         let seq = norm_seq.sequence();
 
-        for kmer in seq.windows(args.kmer){
-            let skmer: Vec<u8> = [&kmer[..mid], &kmer[mid+1..]].concat();
+        for kmer in seq.windows(args.kmer) {
+            let skmer: Vec<u8> = [&kmer[..mid], &kmer[mid + 1..]].concat();
             let mid = &kmer[mid];
 
-            let entry = skmers.entry(skmer).or_insert([0;4]);
+            let entry = skmers.entry(skmer).or_insert([0; 4]);
 
             match mid {
                 b'A' => entry[0] += 1,
@@ -96,4 +94,4 @@ pub fn profile(args: ProfileArgs) {
     info!("Kmer profile ({} total, {} unique)", n_kmers, skmers.len());
 }
 
-    // Return the counts as a tuple}
+// Return the counts as a tuple}
