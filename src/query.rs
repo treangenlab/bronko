@@ -75,10 +75,28 @@ fn check_args(args: &QueryArgs) {
     let available_threads = num_cpus::get();
     if args.threads <= 0 {
         error!("Number of threads must be greater than 0");
-        std::process::exit(1)
+        std::process::exit(1);
     } else if args.threads >= available_threads {
         error!("You requested {} threads but only have {} available on your system", args.threads, available_threads);
-        std::process::exit(1)
+        std::process::exit(1);
+    }
+
+    if args.min_af < 0.01 {
+        warn!("Minimum allele frequency set below 0.01, most variants will be returned. We suggest setting this to a more realistic threshold (0.01-0.05)");
+    } else if args.min_af > 1.0 {
+        error!("Minimum allele frequency set above 1, please set between 0-1 (recommended between 0.01-0.05)");
+        std::process::exit(1);
+    } else if args.min_af >= 0.5 {
+        warn!("Minimum allele frequency set equal to or greater than 0.5, no minor variants will be returned");
+    }
+
+    if args.n_per_strand <= 0 {
+        warn!("Number of kmers per strand set to 0, this is equivalent to no strand filtering")
+    } else if args.n_per_strand >= args.kmer {
+        error!("Number of kmers per strand set >= k, please set lower value (recommended 2-4, default 2)");
+        std::process::exit(1);
+    } else if args.n_per_strand >= 5 {
+        warn!("Number of kmers per strand set very high, only strongly supported variants will be returned")
     }
 
 }
