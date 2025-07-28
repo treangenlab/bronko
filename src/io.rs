@@ -1,4 +1,4 @@
-use needletail::{errors, parse_fastx_file};
+use needletail::{errors, FastxReader, parse_fastx_file};
 
 #[derive(Debug)]
 pub enum FastxError {
@@ -23,7 +23,7 @@ pub fn read_fastq(file: &str) -> Result<(usize, usize), FastxError> {
     let mut n_reads: usize = 0;
 
     // Try to parse the FASTQ file and handle errors
-    let mut reader = parse_fastx_file(file).map_err(|e| FastxError::IoError(e))?;
+    let mut reader: Box<dyn FastxReader + 'static> = parse_fastx_file(file).map_err(|e| FastxError::IoError(e))?;
 
     while let Some(record) = reader.next() {
         let seqrec =

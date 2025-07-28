@@ -1,11 +1,11 @@
 [package]
-name = "intrahost_variants"
+name = "bronko"
 version = "0.1.0"
 edition = "2021"
 authors = [
     "Ryan Doughty <rdd4@rice.edu>"
 ]
-description = "Rapid Intrahost Variation Analyses Using Split K-mers"
+description = "ultra-rapid mapping-free detection of intrahost variation from viral amplicon sequencing data"
 readme = "README.md"
 keywords = ["bioinformatics", "genomics", "sequencing", "k-mer", "viruses"]
 categories = ["command-line-utilities", "science"]
@@ -15,3 +15,13 @@ needletail = "0.6.0"
 clap = { version = "4", features = ["derive"] }
 log = "0"
 simple_logger = "3"
+memory-stats = "1.2.0"
+crossbeam-channel = "0.5.15"
+fxhash = "0.2.1"
+num_cpus = "1.17.0"
+rayon = "1.10.0"
+anyhow = "1.0.98"
+crossbeam = "0.8.4"
+rustc-hash = "2.1.1"
+fastbloom-rs = "0.5.10"
+dashmap = "6.1.0"
