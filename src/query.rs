@@ -137,7 +137,8 @@ pub fn query(args: QueryArgs) {
     // }
 
     //Get the variants from the outputs
-    let variants = call_variants(&args, &output, &output_count, &output_rev, &output_rev_count, 0.01, true, true, 2);
+    println!("{}", args.no_end_filter);
+    let variants = call_variants(&args, &output, &output_count, &output_rev, &output_rev_count, args.min_af, !&args.no_end_filter, !args.no_strand_filter, args.n_per_strand);
     log_memory_usage(true, "Called variants successfully");
 
     print_output(&args, variants, &seq_info);
@@ -203,7 +204,7 @@ pub fn call_variants(
     min_af: f64,
     filter_end_seq: bool,
     strand_filter: bool,
-    n_kmer_per_strand: u8,
+    n_kmer_per_strand: usize,
 ) -> Vec<VCFRecord> {
 
     info!("Calling variants for [replace w filename]");
@@ -245,7 +246,7 @@ pub fn call_variants(
             let row_total: Vec<u64> = (0..4)
                 .map(|b| {
                     if strand_filter {
-                        if count[b] as u8 >= n_kmer_per_strand && count_rev[b] as u8 >= n_kmer_per_strand {
+                        if count[b] as usize >= n_kmer_per_strand && count_rev[b] as usize >= n_kmer_per_strand {
                             row[b] + row_rev[b]
                         } else {
                             0

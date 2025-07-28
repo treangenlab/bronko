@@ -73,6 +73,19 @@ pub struct QueryArgs {
     #[clap(long="min-kmers", default_value_t = MIN_KMER_COUNT,  help_heading="ALGORITHM", help="Minimum times a kmer must occur in sequencing data to be used")]
     pub min_kmers: usize,
 
+    //VARIANT CALLING PARAMETERS
+    #[clap(long="min-af", default_value_t = DEFAULT_MIN_AF, help_heading="VARIANT CALLING PARAMETERS", help="Minimum minor allele frequency to be reported")]
+    pub min_af: f64,
+
+    #[clap(long="no-end-filter", default_value_t = DEFAULT_NO_FILTER_ENDS, help_heading="VARIANT CALLING PARAMETERS", help="Do not filter variants from beginning and end k bases of each segment")]
+    pub no_end_filter: bool,
+
+    #[clap(long="no-strand-filter", default_value_t = DEFAULT_NO_STRAND_FILTER, help_heading="VARIANT CALLING PARAMETERS", help="Do not filter variants that are present on one strand but not the other")]
+    pub no_strand_filter: bool,
+
+    #[clap(long="n-per-strand", default_value_t = DEFAULT_N_KMERS_PER_STRAND, help_heading="VARIANT CALLING PARAMETERS", help="Minimum number of unique kmers to observe on each strand to call a variant at any site")]
+    pub n_per_strand: usize,
+
     //OUTPUT PARAMETERS
     //todo add output locations, output formats
     #[clap(long="output", help_heading="OUTPUT", help="Folder to output all resulting files")]

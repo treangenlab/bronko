@@ -3,3 +3,7 @@ pub const MIN_KMER_SIZE: usize = 5;
 pub const DEFAULT_KMER_SIZE: usize = 19;
 pub const MAX_KMER_SIZE: usize = 31;
 pub const MIN_KMER_COUNT: usize = 10; // minimum number of times a kmer must occur to be run through algorithm
+pub const DEFAULT_MIN_AF: f64 = 0.03;
+pub const DEFAULT_NO_FILTER_ENDS: bool = false;
+pub const DEFAULT_NO_STRAND_FILTER: bool = false;
+pub const DEFAULT_N_KMERS_PER_STRAND: usize = 2;
