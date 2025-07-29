@@ -136,7 +136,12 @@ pub fn query(args: QueryArgs) {
     if args.reads.len() > 0 {
         for se_read in args.reads.iter() {
             info!("Processing {}", se_read);
+
+            //Get kmer counts
             let (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer ) = get_kmers(&se_read, &args);
+            info!("{} reads counted from {}", total_reads, se_read);
+            info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers", unique_counted_kmer, args.min_kmers, unique_kmers, total_kmers);
+            log_memory_usage(true, "Finished counting kmers");
 
             //initialize output storage and then map the kmers using the index
             let (output, output_count, output_rev, output_rev_count) = initialize_output_maps(&seq_info);
@@ -158,7 +163,28 @@ pub fn query(args: QueryArgs) {
     // PROCESS PAIRED END READS
     if args.first_pairs.len() > 0 && args.second_pairs.len() > 0 {
         for (r1, r2) in args.first_pairs.iter().zip(args.second_pairs.iter()){
-            info!("Processing paired reads {}", r1)
+            info!("Processing paired reads {}", r1);
+            let (kmers1, total_reads_r1, total_kmers_r1, unique_kmers_r1, unique_counted_kmer_r1 ) = get_kmers(&r1, &args);
+            let (kmers2, total_reads_r2, total_kmers_r2, unique_kmers_r2, unique_counted_kmer_r2 ) = get_kmers(&r2, &args);
+            info!("{} reads counted from {}", total_reads_r1 + total_reads_r2, r1);
+            info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers", unique_counted_kmer_r1 + unique_counted_kmer_r2, args.min_kmers, unique_kmers_r1 + unique_kmers_r2, total_kmers_r1 + total_kmers_r2);
+            log_memory_usage(true, "Finished counting kmers");
+
+            //initialize output storage and then map the kmers using the index
+            let (output, output_count, output_rev, output_rev_count) = initialize_output_maps(&seq_info);
+            let (n_variant_mapped_r1, n_perfect_mapped_r1) = map_kmers(&kmers1, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
+            let (n_variant_mapped_r2, n_perfect_mapped_r2) = map_kmers(&kmers2, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
+            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped_r1 + n_perfect_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_variant_mapped_r1+n_variant_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, (unique_counted_kmer_r1 + unique_counted_kmer_r2)-(n_perfect_mapped_r1+n_perfect_mapped_r2)-(n_variant_mapped_r1 + n_variant_mapped_r2)); 
+            log_memory_usage(true, &message);
+            if ((n_variant_mapped_r1 + n_variant_mapped_r2 + n_perfect_mapped_r1 + n_perfect_mapped_r2) as f64 / ((unique_counted_kmer_r1 as f64) + (unique_counted_kmer_r2 as f64))) < 0.2 {
+                warn!("Percent of kmers found is very low, suggesting a bad reference, a bad sequencing run, contamination in sample, or some other issue")
+            }
+
+            // call cariants and print them out to vcf
+            let variants = call_variants(&args, &output, &output_count, &output_rev, &output_rev_count, args.min_af, !&args.no_end_filter, !args.no_strand_filter, args.n_per_strand);
+            log_memory_usage(true, "Called variants successfully");
+        
+            print_output(&r1, &args, variants, &seq_info);
         }
     }
 
@@ -174,9 +200,6 @@ pub fn get_kmers(reads_file: &String, args:&QueryArgs) -> (Vec<(String, u64)>, u
             std::process::exit(1);
         }
     };
-    info!("{} reads counted from {}", total_reads, reads_file);
-    info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers", unique_counted_kmer, args.min_kmers, unique_kmers, total_kmers);
-    log_memory_usage(true, "Finished counting kmers, loading kmers");
 
     //read in the kmers and map to the index
     let file_stem = Path::new(&reads_file)
@@ -185,8 +208,8 @@ pub fn get_kmers(reads_file: &String, args:&QueryArgs) -> (Vec<(String, u64)>, u
         .unwrap_or("unknown")
         .to_string();
 
+    
     let kmers = load_kmers(&format!("{}/{}_counts.txt", args.output, file_stem));
-    log_memory_usage(true, "Finished loading kmers");
 
     (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer)
 }
