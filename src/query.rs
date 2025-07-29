@@ -131,8 +131,42 @@ pub fn query(args: QueryArgs) {
         });
     log_memory_usage(true, "Fasta files indexed successfully. Starting counting kmers ");
 
+
+    // PROCESS SINGLE END READS
+    if args.reads.len() > 0 {
+        for se_read in args.reads.iter() {
+            info!("Processing {}", se_read);
+            let (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer ) = get_kmers(&se_read, &args);
+
+            //initialize output storage and then map the kmers using the index
+            let (output, output_count, output_rev, output_rev_count) = initialize_output_maps(&seq_info);
+            let (n_variant_mapped, n_perfect_mapped) = map_kmers(&kmers, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
+            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped, unique_counted_kmer, n_variant_mapped, unique_counted_kmer, unique_counted_kmer-n_perfect_mapped-n_variant_mapped); 
+            log_memory_usage(true, &message);
+            if ((n_variant_mapped + n_perfect_mapped) as f64 / unique_counted_kmer as f64) < 0.2 {
+                warn!("Percent of kmers found is very low, suggesting a bad reference, a bad sequencing run, contamination in sample, or some other issue")
+            }
+
+            // call cariants and print them out to vcf
+            let variants = call_variants(&args, &output, &output_count, &output_rev, &output_rev_count, args.min_af, !&args.no_end_filter, !args.no_strand_filter, args.n_per_strand);
+            log_memory_usage(true, "Called variants successfully");
+        
+            print_output(&se_read, &args, variants, &seq_info);
+        }
+    }
+
+    // PROCESS PAIRED END READS
+    if args.first_pairs.len() > 0 && args.second_pairs.len() > 0 {
+        for (r1, r2) in args.first_pairs.iter().zip(args.second_pairs.iter()){
+            info!("Processing paired reads {}", r1)
+        }
+    }
+
+}
+
+pub fn get_kmers(reads_file: &String, args:&QueryArgs) -> (Vec<(String, u64)>, usize, usize, usize, usize){
     //count kmers using kmc3
-    let kmc_result = count_kmers_kmc(&args);
+    let kmc_result = count_kmers_kmc(&reads_file, &args);
     let (total_reads, total_kmers, unique_kmers, unique_counted_kmer) = match kmc_result {
         Ok(values) => values,
         Err(err_msg) => {
@@ -140,39 +174,37 @@ pub fn query(args: QueryArgs) {
             std::process::exit(1);
         }
     };
-    info!("{} reads counted from {}", total_reads, args.reads[0]);
+    info!("{} reads counted from {}", total_reads, reads_file);
     info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers", unique_counted_kmer, args.min_kmers, unique_kmers, total_kmers);
     log_memory_usage(true, "Finished counting kmers, loading kmers");
 
     //read in the kmers and map to the index
-    let kmers = load_kmers(&format!("{}/kmer_counts.txt", args.output));
+    let file_stem = Path::new(&reads_file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let kmers = load_kmers(&format!("{}/{}_counts.txt", args.output, file_stem));
     log_memory_usage(true, "Finished loading kmers");
 
-    //initialize output storage and then map the kmers using the index
-    let (output, output_count, output_rev, output_rev_count) = initialize_output_maps(&seq_info);
-    let (n_variant_mapped, n_perfect_mapped) = map_kmers(&kmers, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
-    if ((n_variant_mapped + n_perfect_mapped) as f64 / unique_counted_kmer as f64) < 0.2 {
-        warn!("Mapping rate of kmers is very low, suggesting a bad reference, contamination in sample, or some other issue")
-    }
-    let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped, unique_counted_kmer, n_variant_mapped, unique_counted_kmer, unique_counted_kmer-n_perfect_mapped-n_variant_mapped); 
-    log_memory_usage(true, &message);
-
-    //Get the variants from the outputs
-    let variants = call_variants(&args, &output, &output_count, &output_rev, &output_rev_count, args.min_af, !&args.no_end_filter, !args.no_strand_filter, args.n_per_strand);
-    log_memory_usage(true, "Called variants successfully");
-
-    print_output(&args, variants, &seq_info);
-
+    (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer)
 }
 
 pub fn print_output(
+    read_output: &String,
     args: &QueryArgs, 
     variants: Vec<VCFRecord>,
     seq_info: &DashMap<String, usize>
 ){
     info!("Writing output to VCF");
 
-    let vcf_file = File::create(format!("{}/bronko.vcf", args.output)).unwrap_or_else(|e| {
+    let file_stem = Path::new(read_output)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+
+    let vcf_file = File::create(format!("{}/{}.vcf", args.output, file_stem)).unwrap_or_else(|e| {
         error!("{} | Failed to create vcf output file", e);
         std::process::exit(1);
     });
@@ -228,6 +260,9 @@ pub fn call_variants(
     info!("Calling variants for [replace w filename]");
 
     let mut results: Vec<VCFRecord> = Vec::new();
+
+    let mut num_minor_variants = 0;
+    let mut num_major_variants = 0;
 
     for seq_entry in output.iter(){
         let seq = seq_entry.key();
@@ -293,6 +328,12 @@ pub fn call_variants(
                     continue;
                 }
 
+                if af >= 0.5 {
+                    num_major_variants += 1;
+                } else {
+                    num_minor_variants += 1;
+                }
+
                 results.push(VCFRecord { 
                     seq: seq.clone(), 
                     pos: pos, 
@@ -311,7 +352,7 @@ pub fn call_variants(
 
     }
 
-    info!("Called {} minor + major variants above maf={} in [replace w filename]", results.len(), min_af);
+    info!("Called {} minor + {} major variants above maf={} in [replace w filename]", num_minor_variants, num_major_variants, min_af);
     results
 
 }
@@ -319,15 +360,9 @@ pub fn call_variants(
 pub fn build_indexes(args: &QueryArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>>, DashMap<String, usize>), Error> {
 
     info!("Building indexes from fasta files");
-
     let k = args.kmer;
     let index: Arc<Mutex<FxHashMap<u64, Vec<BucketInfo>>>> = Arc::new(Mutex::new(FxHashMap::default()));
     let seq_info: DashMap<String, usize> = DashMap::new();
-
-    // rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().unwrap_or_else(|e|{
-    //     error!("{} | Failed to configure threads", e);
-    //     std::process::exit(1)
-    // });
 
     args.genomes.par_iter().for_each(|file_path|{
         let mut reader = parse_fastx_file(file_path).unwrap_or_else(|e|{
@@ -384,18 +419,15 @@ pub fn build_indexes(args: &QueryArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>
     ))
 }
 
-pub fn count_kmers_kmc(args: &QueryArgs) -> Result<(usize, usize, usize, usize), String> {
-    let fastq_path = args.reads.get(0).expect("Missing FASTQ path").clone();
+pub fn count_kmers_kmc(reads: &String, args: &QueryArgs) -> Result<(usize, usize, usize, usize), String> {
+    let fastq_path = reads.clone();
     let file_stem = Path::new(&fastq_path)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
 
-    let fastq_path_clone = fastq_path.clone();
-    let res_prefix= format!("{}/kmer_counts.res", args.output);
-
-
+    let res_prefix: String= format!("{}/{}.res", args.output, file_stem);
     let kmc_output = Command::new("kmc")
         .args(&[
             &format!("-k{}", args.kmer),
@@ -404,7 +436,7 @@ pub fn count_kmers_kmc(args: &QueryArgs) -> Result<(usize, usize, usize, usize),
             "-b",
             &format!("-ci{}", args.min_kmers),
             "-cs100000",
-            &format!("{}", args.reads[0]),
+            &format!("{}", fastq_path),
             &res_prefix,
             &format!("{}", Path::new(&args.output).join("tmp").to_string_lossy()),
         ])
@@ -432,7 +464,7 @@ pub fn count_kmers_kmc(args: &QueryArgs) -> Result<(usize, usize, usize, usize),
         }
     }
 
-    let dump_txt_path = Path::new(&args.output).join("kmer_counts.txt");
+    let dump_txt_path = Path::new(&args.output).join(&format!("{}_counts.txt", file_stem));
     let kmc_dump_output = Command::new("kmc_tools")
         .args(&[
             "transform",
@@ -500,7 +532,9 @@ pub fn map_kmers(
     let variant_mapped = Arc::clone(&num_variant_mapped);
     let perfect_mapped = Arc::clone(&num_perfect_mapped);
 
-    kmers.par_chunks(10_000).for_each(|chunk| {
+    let chunk_size = if ((kmers.len() / args.threads) as usize) < 10000 { (kmers.len() / args.threads) as usize } else { 10000 };
+
+    kmers.par_chunks(chunk_size).for_each(|chunk| {
 
         for (kmer, n) in chunk {
 
