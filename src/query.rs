@@ -17,6 +17,7 @@ use std::fs::File;
 use std::sync::{Arc, Mutex};
 use std::vec;
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
@@ -99,6 +100,16 @@ fn check_args(args: &QueryArgs) {
         warn!("Number of kmers per strand set very high, only strongly supported variants will be returned")
     }
 
+    if args.first_pairs.len() != args.second_pairs.len() {
+        error!("Number of paired end sequences do not match, exiting.");
+        std::process::exit(1);
+    }
+
+    for (r1, r2) in args.first_pairs.iter().zip(args.second_pairs.iter()){
+        println!("{}, {}", r1, r2)
+    }
+
+
 }
 
 pub fn query(args: QueryArgs) {
@@ -107,18 +118,18 @@ pub fn query(args: QueryArgs) {
     check_args(&args);
     trace!("k={}, threads={}", args.kmer, args.threads);
 
+    // create output directory
     let out_path = Path::new(&args.output);
     fs::create_dir(out_path);
     fs::create_dir(out_path.join("tmp"));
 
     //Get all of the fasta files and process them, get an index
     let (ref_index, seq_info): (FxHashMap<u64, Vec<BucketInfo>>, DashMap<String, usize>) = 
-    build_indexes(&args).unwrap_or_else(|e| {
-        error!("{} | Reference failed to build", e);
-        std::process::exit(1)
-    });
+        build_indexes(&args).unwrap_or_else(|e| {
+            error!("{} | Reference failed to build", e);
+            std::process::exit(1)
+        });
     log_memory_usage(true, "Fasta files indexed successfully. Starting counting kmers ");
-
 
     //count kmers using kmc3
     let kmc_result = count_kmers_kmc(&args);
@@ -134,28 +145,19 @@ pub fn query(args: QueryArgs) {
     log_memory_usage(true, "Finished counting kmers, loading kmers");
 
     //read in the kmers and map to the index
-    let kmers = load_kmers("rust_test1/kmer_counts.txt");
+    let kmers = load_kmers(&format!("{}/kmer_counts.txt", args.output));
     log_memory_usage(true, "Finished loading kmers");
 
     //initialize output storage and then map the kmers using the index
     let (output, output_count, output_rev, output_rev_count) = initialize_output_maps(&seq_info);
-    map_kmers(&kmers, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
-    log_memory_usage(true, "Mapped kmers from [replace w filename]");
-    
-    //temporarily print out the sequences and their counts for debugging
-    // for seq_name in output_rev_count.iter().map(|entry| entry.key().clone()).take(5) {
-    //     if let Some(record) = output_rev_count.get(&seq_name) {
-    //         println!("Sequence: {}", seq_name);
-    //         println!("First 5 counts (pos x base counts):");
-    //         for (pos, counts_arr) in record.counts.iter().enumerate().skip(20).take(5) {
-    //             println!("  pos {}: {:?}", pos+1, counts_arr);
-    //         }
-    //         println!();
-    //     }
-    // }
+    let (n_variant_mapped, n_perfect_mapped) = map_kmers(&kmers, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
+    if ((n_variant_mapped + n_perfect_mapped) as f64 / unique_counted_kmer as f64) < 0.2 {
+        warn!("Mapping rate of kmers is very low, suggesting a bad reference, contamination in sample, or some other issue")
+    }
+    let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped, unique_counted_kmer, n_variant_mapped, unique_counted_kmer, unique_counted_kmer-n_perfect_mapped-n_variant_mapped); 
+    log_memory_usage(true, &message);
 
     //Get the variants from the outputs
-    println!("{}", args.no_end_filter);
     let variants = call_variants(&args, &output, &output_count, &output_rev, &output_rev_count, args.min_af, !&args.no_end_filter, !args.no_strand_filter, args.n_per_strand);
     log_memory_usage(true, "Called variants successfully");
 
@@ -179,7 +181,7 @@ pub fn print_output(
     // write out VCF format
     writeln!(writer, "##fileformat=VCFv4.5").unwrap();
     writeln!(writer, "##source=bronkoV{:.2}", BRONKO_VERSION).unwrap();
-    writeln!(writer, "reference=file://{}", args.genomes[0]).unwrap(); // update to reflect current genome
+    writeln!(writer, "##reference=file://{}", args.genomes[0]).unwrap(); // update to reflect current genome
     for item in seq_info.iter() {
         let (contig, len) = item.pair();
         writeln!(writer, "##contig=<ID={},length={}>", contig.split_whitespace().next().unwrap_or(""), len).unwrap();
@@ -193,8 +195,6 @@ pub fn print_output(
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
         writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{}", seq_out, variant.pos, nucleotide_bits_to_char(variant.ref_base as u64), nucleotide_bits_to_char(variant.alt_base as u64), variant.depth, variant.af, variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt).unwrap()
     }
-
-    //finish with variants    
 
 }
 
@@ -344,7 +344,8 @@ pub fn build_indexes(args: &QueryArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>
             });
 
             let seq: std::borrow::Cow<'_, [u8]> = record.seq();
-            let seq_name = String::from_utf8_lossy(record.id()).to_string();
+            let seq_name = String::from_utf8_lossy(record.id()).to_string().split_whitespace().next().unwrap_or_default().to_string();
+            println!("{}", seq_name);
             let seq_len = seq.len();
             
             seq_info.entry(seq_name.clone()).or_insert(seq_len);
@@ -490,23 +491,35 @@ pub fn map_kmers(
     output_count: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
     output_rev_count: &DashMap<String, OutputData>
-){
+) -> (usize, usize) {
     let k = args.kmer;
 
+    let num_variant_mapped = Arc::new(AtomicUsize::new(0));
+    let num_perfect_mapped = Arc::new(AtomicUsize::new(0));
+
+    let variant_mapped = Arc::clone(&num_variant_mapped);
+    let perfect_mapped = Arc::clone(&num_perfect_mapped);
+
     kmers.par_chunks(10_000).for_each(|chunk| {
+
         for (kmer, n) in chunk {
+
             let (kmer_bin, rc) = canonical_kmer(kmer.as_bytes(), k);
             let buckets = assign_buckets(kmer_bin, k);
 
+            let mut found_buckets = 0;
+
             for &bucket in &buckets {
+
                 if let Some(bucket_infos) = index.get(&bucket) {
+                    found_buckets += 1;
+
                     if bucket_infos.len() == 1 {
                         let info = &bucket_infos[0];
                         let genome_pos = info.location;
                         let seq = &info.seq_name;
                         let nuc_x = info.idx;
                         let ref_base = info.ref_base;
-                        
                         
                         if info.canonical {
                             let pos = k - nuc_x - 1;
@@ -571,8 +584,21 @@ pub fn map_kmers(
                     }
                 }
             }
+
+            if found_buckets == 1 {
+                variant_mapped.fetch_add(1, Ordering::Relaxed);
+            }
+    
+            if found_buckets == k {
+                perfect_mapped.fetch_add(1, Ordering::Relaxed);
+            }
         }
-    })
+    });
+
+    (
+        num_variant_mapped.load(Ordering::Relaxed),
+        num_perfect_mapped.load(Ordering::Relaxed),
+    )
 }
 
 

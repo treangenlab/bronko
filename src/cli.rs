@@ -59,10 +59,10 @@ pub struct QueryArgs {
     pub reads: Vec<String>,
 
     #[clap(num_args=1..,short='1', long="first-pairs", help_heading = "READS INPUT", help = "First pairs for raw paired-end reads (fastq/gzip)")]
-    pub first_pair: Vec<String>,
+    pub first_pairs: Vec<String>,
 
     #[clap(num_args=1.., short='2', long="second-pairs", help_heading="READS INPUT", help = "Second pairs for raw paired-end reads (fastq/gzip)")]
-    pub second_pair: Vec<String>,
+    pub second_pairs: Vec<String>,
 
     //GENERAL ALGORITHM PARAMETERS
     //kmer size
