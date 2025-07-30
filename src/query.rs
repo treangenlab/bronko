@@ -156,6 +156,10 @@ pub fn query(args: QueryArgs) {
             let variants = call_variants(&args, &output, &output_count, &output_rev, &output_rev_count, args.min_af, !&args.no_end_filter, !args.no_strand_filter, args.n_per_strand);
             log_memory_usage(true, "Called variants successfully");
         
+            //print outputs
+            if args.output_pileup {
+                print_pileup(&se_read, &args, &output, &output_rev, &seq_info);
+            }
             print_output(&se_read, &args, variants, &seq_info);
         }
     }
@@ -212,6 +216,40 @@ pub fn get_kmers(reads_file: &String, args:&QueryArgs) -> (Vec<(String, u64)>, u
     let kmers = load_kmers(&format!("{}/{}_counts.txt", args.output, file_stem));
 
     (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer)
+}
+
+pub fn print_pileup(
+    read_output: &String,
+    args: &QueryArgs,
+    output: &DashMap<String, OutputData>,
+    output_rev: &DashMap<String, OutputData>,
+    seq_info: &DashMap<String, usize>
+){
+    info!("Writing output to pileup");
+
+    let file_stem = Path::new(read_output)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+
+    let tsv_pileup = File::create(format!("{}/{}.tsv", args.output, file_stem)).unwrap_or_else(|e| {
+        error!("{} | Failed to create tsv pileup file", e);
+        std::process::exit(1);
+    });
+    let mut writer = BufWriter::new(tsv_pileup);
+
+    writeln!(writer, "reference\tindex\tref\tA\tC\tG\tT\ta\tc\tg\tt");
+
+    for seq_entry in seq_info.iter() {
+        let (seq, seq_len) = seq_entry.pair();
+        let fwd = output.get(seq).expect("Could not match seq to fwd counts");
+        let rev = output_rev.get(seq).expect("Could not match seq to rev counts");
+
+        for (i, (ref_fwd, ref_rev)) in fwd.ref_bases.iter().zip(rev.ref_bases.iter()).enumerate(){
+            let ref_base = if *ref_fwd > 3 {*ref_fwd} else {*ref_rev};
+            writeln!(writer, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", seq, &i + 1 , nucleotide_bits_to_char(ref_base as u64), fwd.counts[i][0], fwd.counts[i][1], fwd.counts[i][2], fwd.counts[i][3], rev.counts[i][0], rev.counts[i][1], rev.counts[i][2], rev.counts[i][3]).unwrap();
+        }
+    }
 }
 
 pub fn print_output(

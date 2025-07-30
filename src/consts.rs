@@ -7,3 +7,4 @@ pub const DEFAULT_MIN_AF: f64 = 0.03;
 pub const DEFAULT_NO_FILTER_ENDS: bool = false;
 pub const DEFAULT_NO_STRAND_FILTER: bool = false;
 pub const DEFAULT_N_KMERS_PER_STRAND: usize = 2;
+pub const DEFAULT_TSV_PILEUP: bool = false;

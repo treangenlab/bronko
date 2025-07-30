@@ -95,6 +95,9 @@ pub struct QueryArgs {
     #[clap(long="output", help_heading="OUTPUT", help="Folder to output all resulting files")]
     pub output: String,
 
+    #[clap(long="pileup", default_value_t = DEFAULT_TSV_PILEUP, help_heading="OUTPUT", help="Also output a tsv of the approximate pileup for each sample and reference")]
+    pub output_pileup: bool,
+
     // OTHER PARAMETERS
     //Number of threads
     #[clap(short, long="threads", default_value_t=1, help="Number of threads")]
