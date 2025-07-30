@@ -403,7 +403,6 @@ pub fn build_indexes(args: &QueryArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>
 
             let seq: std::borrow::Cow<'_, [u8]> = record.seq();
             let seq_name = String::from_utf8_lossy(record.id()).to_string().split_whitespace().next().unwrap_or_default().to_string();
-            println!("{}", seq_name);
             let seq_len = seq.len();
             
             seq_info.entry(seq_name.clone()).or_insert(seq_len);
