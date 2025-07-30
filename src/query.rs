@@ -188,6 +188,11 @@ pub fn query(args: QueryArgs) {
             let variants = call_variants(&args, &output, &output_count, &output_rev, &output_rev_count, args.min_af, !&args.no_end_filter, !args.no_strand_filter, args.n_per_strand);
             log_memory_usage(true, "Called variants successfully");
         
+
+            //print outputs
+            if args.output_pileup {
+                print_pileup(&r1, &args, &output, &output_rev, &seq_info);
+            }
             print_output(&r1, &args, variants, &seq_info);
         }
     }
