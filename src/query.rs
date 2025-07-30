@@ -458,7 +458,7 @@ pub fn count_kmers_kmc(reads: &String, args: &QueryArgs) -> Result<(usize, usize
             &format!("-t{}", args.threads),
             "-b",
             &format!("-ci{}", args.min_kmers),
-            "-cs100000",
+            "-cs1000000",
             &format!("{}", fastq_path),
             &res_prefix,
             &format!("{}", Path::new(&args.output).join("tmp").to_string_lossy()),
