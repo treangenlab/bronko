@@ -83,7 +83,7 @@ fn check_args(args: &QueryArgs) {
     }
 
     if args.min_af < 0.01 {
-        warn!("Minimum allele frequency set below 0.01, most variants will be returned. We suggest setting this to a more realistic threshold (0.01-0.05)");
+        warn!("Minimum allele frequency set below 0.01, more false positive variants will be returned. We suggest setting this to a more realistic threshold (0.01-0.05)");
     } else if args.min_af > 1.0 {
         error!("Minimum allele frequency set above 1, please set between 0-1 (recommended between 0.01-0.05)");
         std::process::exit(1);
@@ -243,7 +243,7 @@ pub fn print_pileup(
     });
     let mut writer = BufWriter::new(tsv_pileup);
 
-    writeln!(writer, "reference\tindex\tref\tA\tC\tG\tT\ta\tc\tg\tt");
+    writeln!(writer, "reference\tindex\tref\tA\tC\tG\tT\ta\tc\tg\tt").unwrap();
 
     for seq_entry in seq_info.iter() {
         let (seq, seq_len) = seq_entry.pair();
@@ -278,7 +278,7 @@ pub fn print_output(
 
     // write out VCF format
     writeln!(writer, "##fileformat=VCFv4.5").unwrap();
-    writeln!(writer, "##source=bronkoV{:.2}", BRONKO_VERSION).unwrap();
+    writeln!(writer, "##source=bronkoV{}", BRONKO_VERSION).unwrap();
     writeln!(writer, "##reference=file://{}", args.genomes[0]).unwrap(); // update to reflect current genome
     for item in seq_info.iter() {
         let (contig, len) = item.pair();

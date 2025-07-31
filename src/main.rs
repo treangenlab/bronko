@@ -13,7 +13,7 @@ pub mod build;
 pub mod util;
 
 fn main() {
-    println!("bronko v{:.2}", BRONKO_VERSION);
+    println!("bronko v{}", BRONKO_VERSION);
     println!("Developed by Ryan Doughty (Rice University)");
     println!("Correspondence: rdd4@rice.edu, treangen@rice.edu\n");
 
@@ -26,5 +26,5 @@ fn main() {
     }
 
     let end = Instant::now();
-    eprintln!("\nbronko v{:.2} finished in {}s", BRONKO_VERSION, end.duration_since(start).as_secs_f32());
+    eprintln!("\nbronko v{} finished in {}s", BRONKO_VERSION, end.duration_since(start).as_secs_f32());
 }

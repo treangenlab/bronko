@@ -1,4 +1,4 @@
-pub const BRONKO_VERSION: f32 = 0.0;
+pub const BRONKO_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MIN_KMER_SIZE: usize = 5;
 pub const DEFAULT_KMER_SIZE: usize = 19;
 pub const MAX_KMER_SIZE: usize = 31;
