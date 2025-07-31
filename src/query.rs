@@ -608,7 +608,18 @@ pub fn map_kmers(
 
             let mut found_buckets = 0;
 
-            for &bucket in &buckets {
+            let filtered_buckets = if args.use_full_kmer {
+                buckets
+            } else {
+                let len = buckets.len();
+                if args.n_fixed * 2 + 1 >= len {
+                    vec![] 
+                } else {
+                    buckets[args.n_fixed..len - args.n_fixed - 1].to_vec()
+                }
+            };
+
+            for &bucket in &filtered_buckets {
 
                 if let Some(bucket_infos) = index.get(&bucket) {
                     found_buckets += 1;

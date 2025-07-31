@@ -73,6 +73,14 @@ pub struct QueryArgs {
     #[clap(long="min-kmers", default_value_t = MIN_KMER_COUNT,  help_heading="ALGORITHM", help="Minimum times a kmer must occur in sequencing data to be used")]
     pub min_kmers: usize,
 
+    //using all the buckets for a kmer
+    #[clap(long="use-full-kmer", default_value_t = DEFAULT_USE_FULL_KMER, help_heading="ALGORITHM", help="Use the entire kmer length for variant positions rather than having [--n-fixed] bases on each end")]
+    pub use_full_kmer: bool,
+
+    //number of buckets to ignore on ends of kmers 
+    #[clap(long="n-fixed", default_value_t = DEFAULT_N_FIXED, help_heading="ALGORITHM", help="Number of fied positions at the end of each kmer")]
+    pub n_fixed: usize,
+
     //VARIANT CALLING PARAMETERS
     //minimum allele frequency to be reported
     #[clap(long="min-af", default_value_t = DEFAULT_MIN_AF, help_heading="VARIANT CALLING PARAMETERS", help="Minimum minor allele frequency to be reported")]
