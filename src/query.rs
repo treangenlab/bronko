@@ -140,7 +140,7 @@ pub fn query(args: QueryArgs) {
             //Get kmer counts
             let (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer ) = get_kmers(&se_read, &args);
             info!("{} reads counted from {}", total_reads, se_read);
-            info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers", unique_counted_kmer, args.min_kmers, unique_kmers, total_kmers);
+            info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers (~{} basepairs)", unique_counted_kmer, args.min_kmers, unique_kmers, total_kmers, total_kmers*args.kmer);
             log_memory_usage(true, "Finished counting kmers");
 
             //initialize output storage and then map the kmers using the index
@@ -167,18 +167,18 @@ pub fn query(args: QueryArgs) {
     // PROCESS PAIRED END READS
     if args.first_pairs.len() > 0 && args.second_pairs.len() > 0 {
         for (r1, r2) in args.first_pairs.iter().zip(args.second_pairs.iter()){
-            info!("Processing paired reads {}", r1);
+            info!("Processing paired reads {}, {}", r1, r2);
             let (kmers1, total_reads_r1, total_kmers_r1, unique_kmers_r1, unique_counted_kmer_r1 ) = get_kmers(&r1, &args);
             let (kmers2, total_reads_r2, total_kmers_r2, unique_kmers_r2, unique_counted_kmer_r2 ) = get_kmers(&r2, &args);
             info!("{} reads counted from {}", total_reads_r1 + total_reads_r2, r1);
-            info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers", unique_counted_kmer_r1 + unique_counted_kmer_r2, args.min_kmers, unique_kmers_r1 + unique_kmers_r2, total_kmers_r1 + total_kmers_r2);
+            info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers (~{} basepairs)", unique_counted_kmer_r1 + unique_counted_kmer_r2, args.min_kmers, unique_kmers_r1 + unique_kmers_r2, total_kmers_r1 + total_kmers_r2, (total_kmers_r1 + total_kmers_r2) * args.kmer);
             log_memory_usage(true, "Finished counting kmers");
 
             //initialize output storage and then map the kmers using the index
             let (output, output_count, output_rev, output_rev_count) = initialize_output_maps(&seq_info);
             let (n_variant_mapped_r1, n_perfect_mapped_r1) = map_kmers(&kmers1, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
             let (n_variant_mapped_r2, n_perfect_mapped_r2) = map_kmers(&kmers2, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
-            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped_r1 + n_perfect_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_variant_mapped_r1+n_variant_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, (unique_counted_kmer_r1 + unique_counted_kmer_r2)-(n_perfect_mapped_r1+n_perfect_mapped_r2)-(n_variant_mapped_r1 + n_variant_mapped_r2)); 
+            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped_r1 + n_perfect_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_variant_mapped_r1+n_variant_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, (unique_counted_kmer_r1 + unique_counted_kmer_r2)-(n_perfect_mapped_r1+n_perfect_mapped_r2)-(n_variant_mapped_r1 + n_variant_mapped_r2), ); 
             log_memory_usage(true, &message);
             if ((n_variant_mapped_r1 + n_variant_mapped_r2 + n_perfect_mapped_r1 + n_perfect_mapped_r2) as f64 / ((unique_counted_kmer_r1 as f64) + (unique_counted_kmer_r2 as f64))) < 0.2 {
                 warn!("Percent of kmers found is very low, suggesting a bad reference, a bad sequencing run, contamination in sample, or some other issue")
@@ -210,14 +210,8 @@ pub fn get_kmers(reads_file: &String, args:&QueryArgs) -> (Vec<(String, u64)>, u
         }
     };
 
-    //read in the kmers and map to the index
-    let file_stem = Path::new(&reads_file)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
 
-    
+    let file_stem = clean_sample_id(&reads_file);
     let kmers = load_kmers(&format!("{}/{}_counts.txt", args.output, file_stem));
 
     (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer)
@@ -232,10 +226,7 @@ pub fn print_pileup(
 ){
     info!("Writing output to pileup");
 
-    let file_stem = Path::new(read_output)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+    let file_stem = clean_sample_id(read_output);
 
     let tsv_pileup = File::create(format!("{}/{}.tsv", args.output, file_stem)).unwrap_or_else(|e| {
         error!("{} | Failed to create tsv pileup file", e);
@@ -257,6 +248,7 @@ pub fn print_pileup(
     }
 }
 
+
 pub fn print_output(
     read_output: &String,
     args: &QueryArgs, 
@@ -265,11 +257,8 @@ pub fn print_output(
 ){
     info!("Writing output to VCF");
 
-    let file_stem = Path::new(read_output)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-
+    let file_stem = clean_sample_id(read_output);
+        
     let vcf_file = File::create(format!("{}/{}.vcf", args.output, file_stem)).unwrap_or_else(|e| {
         error!("{} | Failed to create vcf output file", e);
         std::process::exit(1);
@@ -279,7 +268,7 @@ pub fn print_output(
     // write out VCF format
     writeln!(writer, "##fileformat=VCFv4.5").unwrap();
     writeln!(writer, "##source=bronkoV{}", BRONKO_VERSION).unwrap();
-    writeln!(writer, "##reference=file://{}", args.genomes[0]).unwrap(); // update to reflect current genome
+    writeln!(writer, "##reference=file://{}", read_output).unwrap(); // update to reflect current genome
     for item in seq_info.iter() {
         let (contig, len) = item.pair();
         writeln!(writer, "##contig=<ID={},length={}>", contig.split_whitespace().next().unwrap_or(""), len).unwrap();
@@ -397,6 +386,9 @@ pub fn call_variants(
                 if af >= 0.5 {
                     num_major_variants += 1;
                 } else {
+                    if total_depth < args.min_depth as u64 { // filter out minor variants when the total depth is too low
+                        continue;
+                    } 
                     num_minor_variants += 1;
                 }
 
@@ -486,11 +478,8 @@ pub fn build_indexes(args: &QueryArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>
 
 pub fn count_kmers_kmc(reads: &String, args: &QueryArgs) -> Result<(usize, usize, usize, usize), String> {
     let fastq_path = reads.clone();
-    let file_stem = Path::new(&fastq_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let file_stem = clean_sample_id(&fastq_path);
+
 
     let res_prefix: String= format!("{}/{}.res", args.output, file_stem);
     let kmc_output = Command::new("kmc")

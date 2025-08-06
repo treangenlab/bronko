@@ -1,4 +1,5 @@
 use memory_stats::memory_stats;
+use std::path::Path;
 
 pub fn check_fastq(file: &str) -> bool {
     if file.ends_with(".fq")
@@ -24,6 +25,28 @@ pub fn check_fasta(file: &str) -> bool {
         return true;
     }
     return false;
+}
+
+pub fn clean_sample_id<P: AsRef<Path>>(path: P) -> String {
+    let filename = path.as_ref().file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+
+    // Known FASTQ/A suffixes (ordered by longest first to avoid mismatches)
+    let suffixes = [".fastq.gz", ".fasta.gz", "fna.gz", "fnq.gz", ".fq.gz", ".fastq", ".fasta", ".fnq", ".fna", ".fa", ".fq"];
+
+    for suffix in suffixes.iter() {
+        if filename.ends_with(suffix) {
+            return filename.trim_end_matches(suffix).to_string();
+        }
+    }
+
+    // fallback: remove only the final extension
+    Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 pub fn log_memory_usage(info: bool, message: &str) {
