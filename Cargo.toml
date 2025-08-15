@@ -3,7 +3,9 @@ name = "bronko"
 version = "0.0.0"
 edition = "2021"
 authors = [
-    "Ryan Doughty <rdd4@rice.edu>"
+    "Ryan Doughty <rdd4@rice.edu>",
+    "Michael Tisza <michael.tisza@bcm.edu>",
+    "Todd Treangen <treangen@rice.edu>",
 ]
 description = "ultra-rapid mapping-free detection of intrahost variation from viral amplicon sequencing data"
 readme = "README.md"
