@@ -329,7 +329,9 @@ pub fn call_variants(
         let len = fwd.counts.len();
         let mut start = 0;
         let mut end = len;
+        
 
+        // change the start and end depending if we are filtering the ends of sequences by k
         if filter_end_seq {
             start = args.kmer;
             end = len - args.kmer;
@@ -344,35 +346,57 @@ pub fn call_variants(
             let ref_fwd = fwd.ref_bases[i];
             let ref_rev = rev.ref_bases[i];
 
+            // try to find the ref-base, don't variant call if there is not ACGT in a position
             let ref_base = if ref_fwd < 4 { ref_fwd } else { ref_rev };
             if ref_base >= 4 {
                 continue;
             }
-
             let pos = i + 1;
-            
+
+            // calculate the depths, including those of fwd and reverse, find the min and max of the two for strand filtering purposes
             let row_total: Vec<u64> = (0..4)
-                .map(|b| {
-                    if strand_filter {
-                        if count[b] as usize >= n_kmer_per_strand && count_rev[b] as usize >= n_kmer_per_strand {
-                            row[b] + row_rev[b]
-                        } else {
-                            0
-                        }
-                    } else {
-                        row[b] + row_rev[b]
-                    }
-                })
+                .map(|b| row[b] + row_rev[b])
                 .collect();
+            let fwd_depth: u64 = row.iter().sum();
+            let rev_depth: u64 = row_rev.iter().sum();
+            let percent_strand_depth: f64 = args.min_strand_diff;
 
-            let total_depth:u64 = row_total.iter().sum();
+            let (min_depth_strand, max_depth_strand) = if fwd_depth < rev_depth {
+                (fwd_depth, rev_depth)
+            } else {
+                (rev_depth, fwd_depth)
+            };
 
+            let total_depth = row_total.iter().sum();
             if total_depth == 0 {
-                continue;
+                continue; //maybe replace down the line with logic to fix things
             }
 
+            // loop through each base and variant call if not the reference base
             for alt_base in 0u8..4 {
-                if alt_base == ref_base || row_total[alt_base as usize] == 0 {
+                if alt_base == ref_base || row_total[alt_base as usize] == 0 { //skip if the reference base of if there isn't any depth at that position
+                    continue;
+                }
+
+                /// Strand filter logic
+                /// 
+                /// If the depths are uneven (one is <min_depth_percent% of the total_depth by default)
+                /// then only one of the two strands must pass the n_kmer_per_strand (likely the dominant one)
+                /// otherwise both must pass that filter. 
+                /// 
+                /// If there is no stand filter, then it does not matter, you just let everything pass with the same logic  
+                /// 
+                let pass_strand_filter = if strand_filter {
+                    if min_depth_strand as f64 >= percent_strand_depth * max_depth_strand as f64 {
+                        count[alt_base as usize] as usize >= n_kmer_per_strand && count_rev[alt_base as usize] as usize >= n_kmer_per_strand
+                    } else {
+                        count[alt_base as usize] as usize >= n_kmer_per_strand || count_rev[alt_base as usize] as usize >= n_kmer_per_strand
+                    }
+                } else {
+                    true //might need to change this to follow the portion of above (aka any individual must have n_kmers, but both don't have to)
+                };
+
+                if !pass_strand_filter {
                     continue;
                 }
 
@@ -383,6 +407,7 @@ pub fn call_variants(
                     continue;
                 }
 
+                // call major/minor variants
                 if af >= 0.5 {
                     num_major_variants += 1;
                 } else {
@@ -410,7 +435,7 @@ pub fn call_variants(
 
     }
 
-    info!("Called {} minor + {} major variants above maf={} in [replace w filename]", num_minor_variants, num_major_variants, min_af);
+    info!("Called {} minor + {} major variants above maf={}", num_minor_variants, num_major_variants, min_af);
     results
 
 }

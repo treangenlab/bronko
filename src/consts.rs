@@ -7,6 +7,7 @@ pub const DEFAULT_MIN_AF: f64 = 0.03; // minimum allele frequency to be reported
 pub const DEFAULT_NO_FILTER_ENDS: bool = false; //flag to not filter variants on the ends of sequences 
 pub const DEFAULT_NO_STRAND_FILTER: bool = false; // do not use a strand filter
 pub const DEFAULT_N_KMERS_PER_STRAND: usize = 2;  //number of kmers that are needed to support each strand to call a variant
+pub const DEFAULT_PERCENT_STRAND_DIFF: f64 = 0.1; // percent of total depth something must be to enforce strand filtering
 pub const DEFAULT_TSV_PILEUP: bool = false; //print a pileup as well
 pub const DEFAULT_N_FIXED: usize = 2;   //number of fixed bases in the kmer
 pub const DEFAULT_USE_FULL_KMER: bool = false;  //use the full length of the kmer
