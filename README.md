@@ -5,19 +5,19 @@ bronko is a viral variant caller that can rapidly detect most major and minor va
 
 bronko also allows users to run multiple samples of the same type and build an alignment multifasta that can be inputted directly into most tree software
 
-#### Why use bronko over existing viral variant callers?
+### Why use bronko over existing viral variant callers?
 1. **Simplicity** -- bronko bypasses most steps of typical variant calling (indexing, read mapping, sam manipulation, variant calling, alignment, etc) and packages everything into one command. Given just (sets of) reads and a reference, we will return vcf files, pileups, and optionally alignmnets
 2. **Consistently ultrafast** -- bronko is around an order of magnitude faster than existing tools for read mapping (bowtie2, ie) and then variant calling (lofreq, ivar), particularly when sequencing depth is super high/the number of reads increases. Additionally, although multithreaded, bronko does not need large amounts of threads to run quickly, allowing lightweight deployment
-3.**Comparable accuracy and sensitivity** -- On our benchmarks so far, bronko achieves reasonable consistency with both ivar and lofreq on variant calling, even sometimes outperforming them on recall
+3. **Comparable accuracy and sensitivity** -- On our benchmarks so far, bronko achieves reasonable consistency with both ivar and lofreq on variant calling, even sometimes outperforming them on recall
 
-#### Why not to use bronko
+### Why not to use bronko
 1. If you are interested in identifying indels in viral genomes, currently we do not report on indel presence, but we are working on this problem. 
 
-#### How does bronko work
+### How does bronko work
 byronko bypasses readmapping by directly mapping kmers with small edit distance to a pileup representing the forward and reverse strands. It then uses the depth information and number of kmers mapping to each position/base to perform variant calling. 
 
 ## Some notes before running
-Please perform quality control on your samples before running through this tool. In particular, please remove any primer sequences that were used. It can also be useful to have strict filters on base quality if the 
+Please perform quality control on your samples before running through this tool. In particular, please remove any primer sequences that were used. It is also helpful to have reasonable base quality thresholds (>25 or >30) as bronko does not take into account base quality information. 
 
 ## Requirements
 The only non-rust requirement is KMC3, so please follow the instructions on their github to download the software on your system (either through conda or by downloading the source code directly)
