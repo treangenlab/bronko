@@ -20,7 +20,7 @@ byronko bypasses readmapping by directly mapping kmers with small edit distance 
 Please perform quality control on your samples before running through this tool. In particular, please remove any primer sequences that were used. It is also helpful to have reasonable base quality thresholds (>25 or >30) as bronko does not take into account base quality information. 
 
 ## Requirements
-The only non-rust requirement is KMC3, so please follow the instructions on their github to download the software on your system (either through conda or by downloading the source code directly)
+The only non-rust requirement is KMC3 (https://github.com/refresh-bio/KMC), so please follow the instructions on their github to download the software on your system (either through conda or by downloading the source code directly)
 
 ## How to run
 Once fully released I will put everything on conda, but at the moment, you will have to pull down the source code by cloning this repository, then can use this command from the repo to test if things are working. It should download dependencies (aside from KMC3) from cargo directly:
