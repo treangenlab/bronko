@@ -49,4 +49,4 @@ You can also run multiple files in the same directory at the same time by using 
 
 
 ## Issues
-If you run into any issues, please email Ryan Doughty at rdd4@rice.edu or raise an issue on github
+bronko is still in early versions and we welcome any feedback. If you run into any issues, please email Ryan Doughty at rdd4@rice.edu or raise an issue on github
