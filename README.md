@@ -6,7 +6,7 @@ bronko is a viral variant caller that can rapidly detect most major and minor va
 bronko also allows users to run multiple samples of the same type and build an alignment multifasta that can be inputted directly into most tree software
 
 ### Why use bronko over existing viral variant callers?
-1. **Simplicity** -- bronko bypasses most steps of typical variant calling (indexing, read mapping, sam manipulation, variant calling, alignment, etc) and packages everything into one command. Given just (sets of) reads and a reference, we will return vcf files, pileups, and optionally alignmnets
+1. **Simplicity** -- bronko bypasses most steps of typical variant calling (indexing, read mapping, sam manipulation, variant calling, alignment, etc) and packages everything into one command. Given just (sets of) reads and a reference, we will return vcf files, pileups, and can even give the option to return an alignment that can be used for downstream phylogenetics
 2. **Consistently ultrafast** -- bronko is around an order of magnitude faster than existing tools for read mapping (bowtie2, ie) and then variant calling (lofreq, ivar), particularly when sequencing depth is super high/the number of reads increases. Additionally, although multithreaded, bronko does not need large amounts of threads to run quickly, allowing lightweight deployment
 3. **Comparable accuracy and sensitivity** -- On our benchmarks so far, bronko achieves reasonable consistency with both ivar and lofreq on variant calling, even sometimes outperforming them on recall
 
