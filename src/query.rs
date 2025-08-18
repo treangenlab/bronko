@@ -10,7 +10,7 @@ use needletail::{parse_fastx_file};
 use num_cpus;
 use log::*;
 use crate::consts::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use dashmap::DashMap;
 
 use std::fs::File;
@@ -105,10 +105,9 @@ fn check_args(args: &QueryArgs) {
         std::process::exit(1);
     }
 
-    for (r1, r2) in args.first_pairs.iter().zip(args.second_pairs.iter()){
-        println!("{}, {}", r1, r2)
-    }
-
+    // for (r1, r2) in args.first_pairs.iter().zip(args.second_pairs.iter()){
+    //     println!("{}, {}", r1, r2)
+    // }
 
 }
 
@@ -131,6 +130,9 @@ pub fn query(args: QueryArgs) {
         });
     log_memory_usage(true, "Fasta files indexed successfully. Starting counting kmers ");
 
+    // storing the variant information
+    let total_samples = args.reads.len() + args.first_pairs.len();
+    let mut variant_info: Vec<(String, Vec<VCFRecord>)> = Vec::with_capacity(total_samples); // (sample_name, variant records)
 
     // PROCESS SINGLE END READS
     if args.reads.len() > 0 {
@@ -160,7 +162,10 @@ pub fn query(args: QueryArgs) {
             if args.output_pileup {
                 print_pileup(&se_read, &args, &output, &output_rev, &seq_info);
             }
-            print_output(&se_read, &args, variants, &seq_info);
+            print_output(&se_read, &args, &variants, &seq_info);
+
+            variant_info.push((se_read.to_string(), variants));
+
         }
     }
 
@@ -187,14 +192,92 @@ pub fn query(args: QueryArgs) {
             // call cariants and print them out to vcf
             let variants = call_variants(&args, &output, &output_count, &output_rev, &output_rev_count, args.min_af, !&args.no_end_filter, !args.no_strand_filter, args.n_per_strand);
             log_memory_usage(true, "Called variants successfully");
-        
 
             //print outputs
             if args.output_pileup {
                 print_pileup(&r1, &args, &output, &output_rev, &seq_info);
             }
-            print_output(&r1, &args, variants, &seq_info);
+            print_output(&r1, &args, &variants, &seq_info);
+
+            variant_info.push((r1.to_string(), variants));
+
         }
+    }
+
+    info!("All samples processed successfully");
+
+    if args.output_alignment {
+        info!("Building alignment");
+        build_alignment_fasta(variant_info, &args);
+    }
+
+}
+
+pub fn build_alignment_fasta(
+    sample_variants: Vec<(String, Vec<VCFRecord>)>,
+    args: &QueryArgs
+) {
+        
+    //first collect all sequence/position pairs with a variant and their reference base, as well as a local version for each sample
+    let mut all_positions: FxHashMap<(String, usize), u8> = FxHashMap::default();
+    let mut sample_positions: FxHashMap<String, FxHashMap<(String, usize), u8>> = FxHashMap::default();
+
+    for (sample, vcf_records) in &sample_variants {
+        sample_positions.insert(sample.clone(), FxHashMap::default());
+        for variant in vcf_records {
+            if variant.af >= 0.5 { //store the major variants in the full set and the sample set
+                all_positions.insert((variant.seq.clone(), variant.pos), variant.ref_base);
+                if let Some(sample_map) = sample_positions.get_mut(&sample.clone()) {
+                    sample_map.insert((variant.seq.clone(), variant.pos), variant.alt_base);
+                }
+            }
+        }
+    }
+
+    // then sort all global positions such that they are ordered by seq and position
+    let mut positions: Vec<(String, usize)> = all_positions.keys().cloned().collect();
+    positions.sort_unstable();
+
+    // now just loop through each position for each sample, and each time output a string if that variant is present (or the reference if not)
+    let fasta_out = File::create(format!("{}/alignment.mfa", args.output)).unwrap_or_else(|e| {
+        error!("{} | Failed to create mfa alignment file", e);
+        std::process::exit(1);
+    });
+    let mut writer = BufWriter::new(fasta_out);
+
+    // Output the reference sequence first
+    let mut ref_seq = String::with_capacity(positions.len());
+    for pos_key in &positions {
+        let ref_base = all_positions
+            .get(pos_key)
+            .map(|&b| nucleotide_bits_to_char(b as u64))
+            .unwrap_or('N');
+        ref_seq.push(ref_base);
+    }
+    writeln!(writer, ">{}", args.genomes[0]).unwrap();
+    writeln!(writer, "{}", ref_seq).unwrap();
+
+    for (sample_name, sample_map) in &sample_positions {
+        let mut seq = String::with_capacity(positions.len());
+
+        for pos_key in &positions {
+            // If the sample has a variant at this position, use the alt_base
+            if let Some(&alt_base) = sample_map.get(pos_key) {
+                seq.push(nucleotide_bits_to_char(alt_base as u64)); // u8 → char
+            } else {
+                // Otherwise fall back to reference base from all_positions
+                let ref_base = all_positions
+                    .get(pos_key)
+                    .map(|&b| nucleotide_bits_to_char(b as u64))
+                    .unwrap_or('N');
+                seq.push(ref_base);
+            }
+        }
+
+        let sample_out = clean_sample_id(&sample_name);
+
+        writeln!(writer, ">{}", sample_out).unwrap();
+        writeln!(writer, "{}", seq).unwrap();
     }
 
 }
@@ -252,7 +335,7 @@ pub fn print_pileup(
 pub fn print_output(
     read_output: &String,
     args: &QueryArgs, 
-    variants: Vec<VCFRecord>,
+    variants: &Vec<VCFRecord>,
     seq_info: &DashMap<String, usize>
 ){
     info!("Writing output to VCF");
@@ -298,6 +381,7 @@ struct VCFRecord{
     depth: u64,
     af: f64
 }
+
 
 
 pub fn call_variants(

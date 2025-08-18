@@ -110,8 +110,12 @@ pub struct QueryArgs {
     #[clap(long="output", help_heading="OUTPUT", help="Folder to output all resulting files")]
     pub output: String,
 
-    #[clap(long="pileup", default_value_t = DEFAULT_TSV_PILEUP, help_heading="OUTPUT", help="Also output a tsv of the approximate pileup for each sample and reference")]
+    //EXTRA OUTPUT FORMATS
+    #[clap(long="pileup", default_value_t = DEFAULT_TSV_PILEUP, help_heading="EXTRA OUTPUT FILES", help="Also output a tsv of the approximate pileup for each sample and reference")]
     pub output_pileup: bool,
+
+    #[clap(long="alignment", default_value_t = DEFAULT_ALIGNMENT, help_heading="EXTRA OUTPUT FILES", help="Output an multifasta containing the alignment of all samples to the reference and themselves (only major variant positions)")]
+    pub output_alignment: bool,
 
     // OTHER PARAMETERS
     //Number of threads
