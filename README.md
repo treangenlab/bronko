@@ -3,7 +3,7 @@
 ## Introduction
 bronko is a viral variant caller that can rapidly detect most major and minor variants in any given sequencing dataset. bronko bypasses read mapping and variant calling and directly outputs a VCF from reads and a reference genome.  
 
-bronko also allows users to run multiple samples of the same type and build an alignment multifasta that can be inputted directly into most tree software
+bronko also allows users to run multiple samples of the same species and build an alignment that can be inputted directly into phylogenetics software
 
 ### Why use bronko over existing viral variant callers?
 1. **Simplicity** -- bronko bypasses most steps of typical variant calling (indexing, read mapping, sam manipulation, variant calling, alignment, etc) and packages everything into one command. Given just (sets of) reads and a reference, we will return vcf files, pileups, and can even give the option to return an alignment that can be used for downstream phylogenetics
