@@ -20,6 +20,7 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
+use rayon::join;
 
 use std::path::Path;
 use std::io::{BufReader, BufRead, BufWriter, Write};
@@ -140,14 +141,14 @@ pub fn query(args: QueryArgs) {
             info!("Processing {}", se_read);
 
             //Get kmer counts
-            let (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer ) = get_kmers(&se_read, &args);
+            let (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer ) = get_kmers(&se_read, &args.threads, &args);
             info!("{} reads counted from {}", total_reads, se_read);
             info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers (~{} basepairs)", unique_counted_kmer, args.min_kmers, unique_kmers, total_kmers, total_kmers*args.kmer);
             log_memory_usage(true, "Finished counting kmers");
 
             //initialize output storage and then map the kmers using the index
             let (output, output_count, output_rev, output_rev_count) = initialize_output_maps(&seq_info);
-            let (n_variant_mapped, n_perfect_mapped) = map_kmers(&kmers, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
+            let (n_variant_mapped, n_perfect_mapped) = map_kmers(&kmers, &ref_index, &args.threads, &args, &output, &output_count, &output_rev, &output_rev_count);
             let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped, unique_counted_kmer, n_variant_mapped, unique_counted_kmer, unique_counted_kmer-n_perfect_mapped-n_variant_mapped); 
             log_memory_usage(true, &message);
             if ((n_variant_mapped + n_perfect_mapped) as f64 / unique_counted_kmer as f64) < 0.2 {
@@ -173,16 +174,22 @@ pub fn query(args: QueryArgs) {
     if args.first_pairs.len() > 0 && args.second_pairs.len() > 0 {
         for (r1, r2) in args.first_pairs.iter().zip(args.second_pairs.iter()){
             info!("Processing paired reads {}, {}", r1, r2);
-            let (kmers1, total_reads_r1, total_kmers_r1, unique_kmers_r1, unique_counted_kmer_r1 ) = get_kmers(&r1, &args);
-            let (kmers2, total_reads_r2, total_kmers_r2, unique_kmers_r2, unique_counted_kmer_r2 ) = get_kmers(&r2, &args);
+
+            let half_threads = &args.threads / 2;
+            let ((kmers1, total_reads_r1, total_kmers_r1, unique_kmers_r1, unique_counted_kmer_r1),
+                 (kmers2, total_reads_r2, total_kmers_r2, unique_kmers_r2, unique_counted_kmer_r2)) =
+                join(
+                    || get_kmers(r1, &half_threads, &args),
+                    || get_kmers(r2, &half_threads, &args),
+                );
             info!("{} reads counted from {}", total_reads_r1 + total_reads_r2, r1);
             info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers (~{} basepairs)", unique_counted_kmer_r1 + unique_counted_kmer_r2, args.min_kmers, unique_kmers_r1 + unique_kmers_r2, total_kmers_r1 + total_kmers_r2, (total_kmers_r1 + total_kmers_r2) * args.kmer);
             log_memory_usage(true, "Finished counting kmers");
 
             //initialize output storage and then map the kmers using the index
             let (output, output_count, output_rev, output_rev_count) = initialize_output_maps(&seq_info);
-            let (n_variant_mapped_r1, n_perfect_mapped_r1) = map_kmers(&kmers1, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
-            let (n_variant_mapped_r2, n_perfect_mapped_r2) = map_kmers(&kmers2, &ref_index, &args, &output, &output_count, &output_rev, &output_rev_count);
+            let (n_variant_mapped_r1, n_perfect_mapped_r1) = map_kmers(&kmers1, &ref_index, &half_threads, &args, &output, &output_count, &output_rev, &output_rev_count);
+            let (n_variant_mapped_r2, n_perfect_mapped_r2) = map_kmers(&kmers2, &ref_index, &half_threads, &args, &output, &output_count, &output_rev, &output_rev_count);
             let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped_r1 + n_perfect_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_variant_mapped_r1+n_variant_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, (unique_counted_kmer_r1 + unique_counted_kmer_r2)-(n_perfect_mapped_r1+n_perfect_mapped_r2)-(n_variant_mapped_r1 + n_variant_mapped_r2), ); 
             log_memory_usage(true, &message);
             if ((n_variant_mapped_r1 + n_variant_mapped_r2 + n_perfect_mapped_r1 + n_perfect_mapped_r2) as f64 / ((unique_counted_kmer_r1 as f64) + (unique_counted_kmer_r2 as f64))) < 0.2 {
@@ -282,9 +289,9 @@ pub fn build_alignment_fasta(
 
 }
 
-pub fn get_kmers(reads_file: &String, args:&QueryArgs) -> (Vec<(String, u64)>, usize, usize, usize, usize){
+pub fn get_kmers(reads_file: &String, threads: &usize, args:&QueryArgs) -> (Vec<(String, u64)>, usize, usize, usize, usize){
     //count kmers using kmc3
-    let kmc_result = count_kmers_kmc(&reads_file, &args);
+    let kmc_result = count_kmers_kmc(&reads_file, &threads, &args);
     let (total_reads, total_kmers, unique_kmers, unique_counted_kmer) = match kmc_result {
         Ok(values) => values,
         Err(err_msg) => {
@@ -585,7 +592,7 @@ pub fn build_indexes(args: &QueryArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>
     ))
 }
 
-pub fn count_kmers_kmc(reads: &String, args: &QueryArgs) -> Result<(usize, usize, usize, usize), String> {
+pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &QueryArgs) -> Result<(usize, usize, usize, usize), String> {
     let fastq_path = reads.clone();
     let file_stem = clean_sample_id(&fastq_path);
 
@@ -595,7 +602,7 @@ pub fn count_kmers_kmc(reads: &String, args: &QueryArgs) -> Result<(usize, usize
         .args(&[
             &format!("-k{}", args.kmer),
             "-m2",
-            &format!("-t{}", args.threads),
+            &format!("-t{}", threads),
             "-b",
             &format!("-ci{}", args.min_kmers),
             "-cs1000000",
@@ -681,6 +688,7 @@ fn load_kmers(path: &str) -> Vec<(String, u64)> {
 pub fn map_kmers(
     kmers: &Vec<(String, u64)>,
     index: &FxHashMap<u64, Vec<BucketInfo>>,
+    threads: &usize,
     args: &QueryArgs,
     output: &DashMap<String, OutputData>,
     output_count: &DashMap<String, OutputData>,
@@ -695,7 +703,7 @@ pub fn map_kmers(
     let variant_mapped = Arc::clone(&num_variant_mapped);
     let perfect_mapped = Arc::clone(&num_perfect_mapped);
 
-    let chunk_size = if ((kmers.len() / args.threads) as usize) < 10000 { (kmers.len() / args.threads) as usize } else { 10000 };
+    let chunk_size = if ((kmers.len() / threads) as usize) < 10000 { (kmers.len() / threads) as usize } else { 10000 };
 
     kmers.par_chunks(chunk_size).for_each(|chunk| {
 
