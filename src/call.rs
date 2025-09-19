@@ -28,15 +28,15 @@ use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub struct BucketInfo {
-    pub file_name: String, //file name it refers to
-    pub seq_name: String, //sequence name (in case mulitple in file)
-    pub location: usize, //location of kmer in genome
+    pub file_name: String, //file name it refers to --> should be able to remove this
+    pub seq_name: String, //sequence name (in case mulitple in file) --> should be able to remove this
+    pub location: usize, //location of kmer in genome --> can I add location + idx
     pub idx: usize, //nucleotide within the kmer the bucket points to
     pub ref_base: u8, //reference base 00, 01, 10, 11 
-    pub canonical: bool, //was the base converted to canonical
+    pub canonical: bool, //was the base converted to canonical 
 }
 
-fn check_args(args: &QueryArgs) {
+fn check_args(args: &CallArgs) {
     let output_level;
     if args.verbose {
         output_level = log::LevelFilter::Trace;
@@ -112,7 +112,7 @@ fn check_args(args: &QueryArgs) {
 
 }
 
-pub fn query(args: QueryArgs) {
+pub fn call(args: CallArgs) {
 
     //First check to make sure none of the arguments are invalid
     check_args(&args);
@@ -222,7 +222,7 @@ pub fn query(args: QueryArgs) {
 
 pub fn build_alignment_fasta(
     sample_variants: Vec<(String, Vec<VCFRecord>)>,
-    args: &QueryArgs
+    args: &CallArgs
 ) {
         
     //first collect all sequence/position pairs with a variant and their reference base, as well as a local version for each sample
@@ -289,7 +289,7 @@ pub fn build_alignment_fasta(
 
 }
 
-pub fn get_kmers(reads_file: &String, threads: &usize, args:&QueryArgs) -> (Vec<(String, u64)>, usize, usize, usize, usize){
+pub fn get_kmers(reads_file: &String, threads: &usize, args:&CallArgs) -> (Vec<(String, u64)>, usize, usize, usize, usize){
     //count kmers using kmc3
     let kmc_result = count_kmers_kmc(&reads_file, &threads, &args);
     let (total_reads, total_kmers, unique_kmers, unique_counted_kmer) = match kmc_result {
@@ -309,7 +309,7 @@ pub fn get_kmers(reads_file: &String, threads: &usize, args:&QueryArgs) -> (Vec<
 
 pub fn print_pileup(
     read_output: &String,
-    args: &QueryArgs,
+    args: &CallArgs,
     output: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
     seq_info: &DashMap<String, usize>
@@ -341,7 +341,7 @@ pub fn print_pileup(
 
 pub fn print_output(
     read_output: &String,
-    args: &QueryArgs, 
+    args: &CallArgs, 
     variants: &Vec<VCFRecord>,
     seq_info: &DashMap<String, usize>
 ){
@@ -392,7 +392,7 @@ struct VCFRecord{
 
 
 pub fn call_variants(
-    args: &QueryArgs, 
+    args: &CallArgs, 
     output: &DashMap<String, OutputData>,
     output_count: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
@@ -531,7 +531,7 @@ pub fn call_variants(
 
 }
 
-pub fn build_indexes(args: &QueryArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>>, DashMap<String, usize>), Error> {
+pub fn build_indexes(args: &CallArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>>, DashMap<String, usize>), Error> {
 
     info!("Building indexes from fasta files");
     let k = args.kmer;
@@ -592,7 +592,7 @@ pub fn build_indexes(args: &QueryArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>
     ))
 }
 
-pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &QueryArgs) -> Result<(usize, usize, usize, usize), String> {
+pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Result<(usize, usize, usize, usize), String> {
     let fastq_path = reads.clone();
     let file_stem = clean_sample_id(&fastq_path);
 
@@ -689,7 +689,7 @@ pub fn map_kmers(
     kmers: &Vec<(String, u64)>,
     index: &FxHashMap<u64, Vec<BucketInfo>>,
     threads: &usize,
-    args: &QueryArgs,
+    args: &CallArgs,
     output: &DashMap<String, OutputData>,
     output_count: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,

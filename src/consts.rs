@@ -13,3 +13,4 @@ pub const DEFAULT_ALIGNMENT: bool = false;
 pub const DEFAULT_N_FIXED: usize = 2;   //number of fixed bases in the kmer
 pub const DEFAULT_USE_FULL_KMER: bool = false;  //use the full length of the kmer
 pub const DEFAULT_MIN_DEPTH: usize = MIN_KMER_COUNT*100;
+pub const DEFAULT_INDEX_OUTPUT: &str = "bronko";

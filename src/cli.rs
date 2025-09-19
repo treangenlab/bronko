@@ -1,8 +1,19 @@
 use crate::consts::*;
 use clap::{Args, Parser, Subcommand};
+use clap::builder::styling::{AnsiColor, Effects, Styles};
+
+
+fn custom_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Blue.on_default() | Effects::BOLD)
+        .usage(AnsiColor::White.on_default() | Effects::BOLD)
+        .literal(AnsiColor::White.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::White.on_default())
+        // You can customize other elements as well, like error messages, hints, etc.
+}
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, styles=custom_styles())]
 #[command(propagate_version = true)]
 pub struct Cli {
     #[clap(subcommand)]
@@ -13,27 +24,30 @@ pub struct Cli {
 pub enum Mode {
     //end-to-end --> runs everything
     Build(BuildArgs), //Build --> parses a genome(s) and builds the data strucutre that we want to map to later
-    Query(QueryArgs), //Query --> takes the genomes and sequencing data and does the intrahost variation analysis
+    Call(CallArgs), //Call --> takes the genomes and sequencing data and does the viral variation analysis
 }
 
-
 #[derive(Args, Default)]
+#[clap(about="Create an bronko index of existing viral references for a given species")]
 pub struct BuildArgs {
-    // the fasta file to be used as a reference
-    #[clap(
-        short,
-        long = "genome",
-        help_heading = "INPUT",
-        help = "Genome fasta(.gz) file"
-    )]
-    pub genome: String,
 
+    //REFERENCE INPUT
+    // the fasta file to be used as a reference
+    #[clap(num_args=1.., short='g', long = "genomes", help_heading = "REFERENCE INPUT", help = "Genome files to be built into index (fasta/gzip)")]
+    pub genomes: Vec<String>,
+
+    // INDEXING PARAMETERS
     // the kmer size
     #[clap(short, long="kmer-size", default_value_t = DEFAULT_KMER_SIZE, help_heading="KMER", help="Kmer size")]
     pub kmer: usize,
 
+    //OUTPUT 
+    #[clap(short='o', long="output", default_value = DEFAULT_INDEX_OUTPUT, help_heading="OUTPUT", help="Name of index file (.bki will be added)")]
+    pub output: String,
+
+    // OTHER PARAMETERS
     //Number of threads
-    #[clap(short, long="threads", default_value_t=1, help="Number of threads")]
+    #[clap(short, long="threads", default_value_t=4, help="Number of threads")]
     pub threads: usize,
 
     //Debug mode
@@ -46,7 +60,8 @@ pub struct BuildArgs {
 }
 
 #[derive(Args)]
-pub struct QueryArgs {
+#[clap(about="Perform rapid viral variant calling of viral sequencing data")]
+pub struct CallArgs {
 
     // REFERENCE INPUT
     #[clap(num_args=1.., short='g', long = "genomes", help_heading = "REFERENCE INPUT", help = "Genome fasta(.gz) files to use as references")]
@@ -119,7 +134,7 @@ pub struct QueryArgs {
 
     // OTHER PARAMETERS
     //Number of threads
-    #[clap(short, long="threads", default_value_t=1, help="Number of threads")]
+    #[clap(short, long="threads", default_value_t=4, help="Number of threads")]
     pub threads: usize,
 
     //Debug mode

@@ -1,18 +1,7 @@
 use crate::cli::*;
 use crate::util::*;
-
+use crate::consts::*;
 use log::*;
-// use needletail::{FastxReader, parse_fastx_file};
-
-// use std::collections::HashMap;
-
-///
-/// Struct for an entry in the hashmap, contains the kmer
-/// 
-// struct Kmer {
-//     kmer: BitNuclKmer,
-//     location: usize,
-// }
 
 fn check_args(args: &BuildArgs) {
     let output_level;
@@ -29,172 +18,96 @@ fn check_args(args: &BuildArgs) {
         .init()
         .unwrap();
 
-    // trace!("Test Trace");
-    // debug!("Test Debug");
-    // info!("Test Info");
 
     //Check kmer size to make sure it is odd and greater than 3
-    if args.kmer < 3 {
-        error!("Invalid kmer size, must >= 3");
+    if args.kmer % 2 != 1 || args.kmer > MAX_KMER_SIZE || args.kmer < MIN_KMER_SIZE {
+        error!("Invalid kmer size, must be odd and between [{}-{}]", MIN_KMER_SIZE, MAX_KMER_SIZE);
         std::process::exit(1)
     }
 
-    //check to see if input is fastq file
-    if !check_fasta(&args.genome) {
-        error!("Input is not a fasta file (must be .fq(.gz)/.fastq(.gz)/.fnq(.gz))");
-        std::process::exit(1)
+    for fasta_file in &args.genomes {
+        if !check_fasta(&fasta_file){
+            error!("{} does not appear to be a fasta file (must be .fa(.gz)/.fasta(.gz)/.fna(.gz))", &fasta_file);
+            std::process::exit(1)
+        }
+    }
+
+    let available_threads = num_cpus::get();
+    if args.threads <= 0 {
+        error!("Number of threads must be greater than 0");
+        std::process::exit(1);
+    } else if args.threads >= available_threads {
+        error!("You requested {} threads but only have {} available on your system", args.threads, available_threads);
+        std::process::exit(1);
     }
 
 }
-
 
 pub fn build(args: BuildArgs) {
-    //check the arguments
+
+    //Check arguments for building index
     check_args(&args);
-
-    info!("Starting build")
-
-    // info!("Running Building");
-    // let mut reader = parse_fastx_file(&args.genome).unwrap_or_else(|e| {
-    //     error!("Fasta unable to be read: {}", e);
-    //     std::process::exit(1);
-    // });
     
-    // while let Some(record) = reader.next() {
-    //     let seqrec = record.unwrap_or_else(|e| {
-    //         error!("Invalid record in {}: {}", &args.genome, e);
-    //         std::process::exit(1);
-    //     });
-    // };    
-    //     for i in 0..=seq.len().saturating_sub(k) {
-    //         let kmer = &seq[i..i + k];
-
-    //         // Get canonical k-mer and its binary representation
-    //         if let Some(bit_kmer) = BitNuclKmer::from_text(kmer) {
-    //             let canonical = bit_kmer.canonical();
-    //             let binary = canonical.to_u64();
-
-    //             // Store in HashSet (unique k-mers)
-    //             unique_kmers.insert(binary);
-
-    //             // Store in HashMap (k-mer counts)
-    //             *kmer_counts.entry(binary).or_insert(0) += 1;
-    //         } else {
-    //             error!("Invalid k-mer at position {}", i);
-    //         }
-    //     }
-
-    // }
-    
-
-    // Some nice statistics to have
-    // let mut n_contigs: usize = 0;
-    // let mut n_bases: usize = 0;
-    // let mut n_kmers: usize = 0;
-
-    // let mid: usize = &args.kmer / 2; //for finding the split kmer
-
-    // let mut skmers: HashMap<Vec<u8>, [u32; 4]> = HashMap::new();
-
-    // trace!("Building the skmer hashmap");
-    // while let Some(record) = reader.next() {
-    //     let seqrec = record.unwrap_or_else(|e| {
-    //         error!("Invalid record in {}: {}", &args.genome, e);
-    //         std::process::exit(1);
-    //     });
-
-    //     let norm_seq = seqrec.normalize(false);
-    //     let seq = norm_seq.sequence();
-
-    //     //for now just count reads and bases and return them
-    //     n_contigs += 1;
-    //     n_bases += seqrec.num_bases();
-    // }
-
-    // info!("Number of contigs in '{}': {}", &args.genome, n_contigs);
-    // info!("Total bases in '{}': {}", &args.genome, n_bases);
-    // info!("Kmer profile of genome ({} total, {} unique)", n_kmers, skmers.len());
-
-    // let mut reader = parse_fastx_file(&args.input).unwrap_or_else(|e| {
-    //     error!("Fastq unable to be read: {}", e);
-    //     std::process::exit(1);
-    // });
-
-    // //FASTQ PARSING
-
-    // let mut n_reads_fq = 0;
-    // let mut n_bases_fq = 0;
-    // let mut n_matching_kmers = 0;
-    // let mut n_divergent_skmers = 0;
-
-    // let mut skmers_divergent: HashMap<Vec<u8>, [u32; 4]> = HashMap::new();
-
-    // while let Some(record) = reader.next() {
-    //     let seqrec = record.unwrap_or_else(|e| {
-    //         error!("Invalid record in {}: {}", &args.input, e);
-    //         std::process::exit(1);
-    //     });
-
-    //     let norm_seq = seqrec.normalize(false);
-    //     let seq = norm_seq.sequence();
-
-    //     for kmer in seq.windows(args.kmer) {
-    //         let (skmer, mid_base) = extract_kmer_parts(&kmer, mid);
-    //         if let Some(entry) = skmers.get_mut(&skmer) {
-    //             // skmer exists in skmers, update the corresponding nucleotide count
-    //             match mid_base {
-    //                 b'A' => entry[0] += 1,
-    //                 b'C' => entry[1] += 1,
-    //                 b'G' => entry[2] += 1,
-    //                 b'T' => entry[3] += 1,
-    //                 _ => (),
-    //             }
-    //             n_matching_kmers += 1;
-    //         } else {
-    //             let entry = skmers_divergent.entry(skmer).or_insert([0; 4]);
-    //             match mid_base {
-    //                 b'A' => entry[0] += 1,
-    //                 b'C' => entry[1] += 1,
-    //                 b'G' => entry[2] += 1,
-    //                 b'T' => entry[3] += 1,
-    //                 _ => (),
-    //             }
-    //             n_divergent_skmers += 1;
-                
-    //         }
-    //     }
-    //     n_reads_fq += 1;
-    //     n_bases_fq += seqrec.num_bases();
-    // }
-
-    // info!("Number of reads in '{}': {}", &args.input, n_reads_fq);
-    // info!("Total bases in '{}': {}", &args.input, n_bases_fq);
-    // info!("Skmer profile of sequencing data ({} total, {} matched, {} divergent)", n_matching_kmers + n_divergent_skmers, n_matching_kmers, n_divergent_skmers);
-
-    // // Loop through the skmer profile and print how many have divergent nucleotides
-    // let threshold: u32 = 5; // TODO: will add as input parameter
-    // let mut count_no_values = 0;
-    // let mut count_one_value = 0;
-    // let mut filtered_skmers: Vec<(&Vec<u8>, &[u32; 4])> = Vec::new();
-
-    // for (skmer, counts) in &skmers {
-    //     let above_threshold = counts.iter().filter(|&&count| count > threshold).count();
-
-    //     if above_threshold > 1 {
-    //         filtered_skmers.push((skmer, counts));
-    //     } else if counts.iter().all(|&count| count == 0) {
-    //         count_no_values += 1;
-    //     } else if above_threshold == 1 {
-    //         count_one_value += 1;
-    //     }
-    // }
-
-    // info!("Skmer entries not found: {}/{}", count_no_values, n_kmers);
-    // info!("Skmer entries with no mutational profile: {}", count_one_value);
-
-    // info!("Potential intrahost variation sites: {}", filtered_skmers.len())
-    
-
 }
 
-// Return the counts as a tuple}
+
+// pub fn build_indexes(args: &QueryArgs) -> Result<(FxHashMap<u64, Vec<BucketInfo>>, DashMap<String, usize>), Error> {
+
+//     info!("Building indexes from fasta files");
+//     let k = args.kmer;
+//     let index: Arc<Mutex<FxHashMap<u64, Vec<BucketInfo>>>> = Arc::new(Mutex::new(FxHashMap::default()));
+//     let seq_info: DashMap<String, usize> = DashMap::new();
+
+//     args.genomes.par_iter().for_each(|file_path|{
+//         let mut reader = parse_fastx_file(file_path).unwrap_or_else(|e|{
+//             error!("{} | Failed to parse fasta file: {}", e, file_path);
+//             std::process::exit(1)
+//         });
+
+//         let file_name = Path::new(file_path).file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+
+//         while let Some(record) = reader.next() {
+//             let record = record.unwrap_or_else(|e|{
+//                 error!("{} | Unable to read record in {}", e, file_path);
+//                 std::process::exit(1)
+//             });
+
+//             let seq: std::borrow::Cow<'_, [u8]> = record.seq();
+//             let seq_name = String::from_utf8_lossy(record.id()).to_string().split_whitespace().next().unwrap_or_default().to_string();
+//             let seq_len = seq.len();
+            
+//             seq_info.entry(seq_name.clone()).or_insert(seq_len);
+
+//             // trace!("Identified {}", seq_name);
+//             trace!("{} kmers in {}", seq.len().saturating_sub(k), seq_name);
+//             for i in 0..=seq.len().saturating_sub(k){
+//                 let kmer: &[u8] = &seq[i..i+k];
+//                 let (kmer_bin, canonical) = canonical_kmer(kmer, k);
+//                 let buckets = assign_buckets(kmer_bin, k);
+
+//                 for (j, bucket_id) in buckets.iter().enumerate(){
+//                     let bucket = BucketInfo {
+//                         file_name: file_name.clone(), //might want to change this in the future as it is kind of redundant
+//                         seq_name: seq_name.clone(),
+//                         location: i, //should be able to combine location + idx into single location
+//                         idx: j,
+//                         ref_base: nt_to_bits(kmer[j]) as u8, //this also is redundant
+//                         canonical: canonical //this is maybe the only important thing aside from location
+//                     };
+
+//                     let mut locked = index.lock().unwrap();
+//                     locked.entry(*bucket_id).or_default().push(bucket);
+//                 }
+//             }
+//         }
+
+//     });
+
+//     Ok((
+//         Arc::try_unwrap(index)
+//             .unwrap()
+//             .into_inner()
+//             .unwrap(),
+//         seq_info
+//     ))
+// }

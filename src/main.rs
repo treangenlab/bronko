@@ -6,7 +6,7 @@ use cli::*;
 use crate::consts::BRONKO_VERSION;
 
 pub mod consts;
-pub mod query;
+pub mod call;
 pub mod io;
 pub mod lcb;
 pub mod build;
@@ -21,8 +21,8 @@ fn main() {
 
     let args = cli::parse_args();
     match args.mode {
-        Mode::Query(query_args) => query::query(query_args),
-        Mode::Build(profile_args) => build::build(profile_args),
+        Mode::Call(call_args) => call::call(call_args),
+        Mode::Build(build_args) => build::build(build_args),
     }
 
     let end = Instant::now();
