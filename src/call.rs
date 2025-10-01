@@ -99,6 +99,19 @@ fn check_args(args: &CallArgs) {
 
 }
 
+#[derive(Debug)]
+pub struct OutputInfo {
+    filename: String,
+    selected_genome: String,
+    num_major_variants: usize,
+    num_minor_variants: usize,
+    breadth_coverage: f64,
+    depth_coverage: f64,
+    num_perfect_kmers: usize,
+    num_variant_kmers: usize,
+    num_unmapped_kmers: usize
+}
+
 pub fn call(args: CallArgs) {
 
     //First check to make sure none of the arguments are invalid
@@ -120,6 +133,7 @@ pub fn call(args: CallArgs) {
     // storing the variant information
     let total_samples = args.reads.len() + args.first_pairs.len();
     let mut variant_info: Vec<(String, Vec<VCFRecord>)> = Vec::with_capacity(total_samples); // (sample_name, variant records)
+    let mut output_info: Vec<OutputInfo> = Vec::with_capacity(total_samples); //storing the outputs for tsv overview
 
     // PROCESS SINGLE END READS
     if args.reads.len() > 0 {
@@ -152,7 +166,8 @@ pub fn call(args: CallArgs) {
             });
             let best_genome_filename = &viral_metadata.files[best_genome_index as usize].name;
             info!("Selected a representative genome: {}", best_genome_filename);
-            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped, unique_counted_kmer, n_variant_mapped, unique_counted_kmer, unique_counted_kmer-n_perfect_mapped-n_variant_mapped); 
+            let n_unmapped_kmers = unique_counted_kmer-n_perfect_mapped-n_variant_mapped;
+            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped, unique_counted_kmer, n_variant_mapped, unique_counted_kmer, n_unmapped_kmers); 
             log_memory_usage(true, &message);
 
             if ((n_variant_mapped + n_perfect_mapped) as f64 / unique_counted_kmer as f64) < 0.2 {
@@ -160,13 +175,13 @@ pub fn call(args: CallArgs) {
             }
 
             
-            // call cariants and print them out to vcf
+            // call variants and print them out to vcf
             let (output, output_rev, output_counts, output_rev_counts)= output_maps.get(&best_genome_index).unwrap_or_else(|| {
                 error!("Failed to find mapping data for selected genome");
                 std::process::exit(1);
             });
 
-            let variants = call_variants(
+            let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
                 &args,
                 output,
                 output_counts,
@@ -185,6 +200,17 @@ pub fn call(args: CallArgs) {
             }
             print_output(&se_read, &args, &variants, &viral_metadata, &best_genome_index);
 
+            output_info.push(OutputInfo {
+                filename: se_read.to_string(),
+                selected_genome: best_genome_filename.to_string(),
+                num_major_variants: num_major_variants,
+                num_minor_variants: num_minor_variants,
+                breadth_coverage: breadth_cov,
+                depth_coverage: depth_cov,
+                num_perfect_kmers: *n_perfect_mapped,
+                num_variant_kmers: *n_variant_mapped,
+                num_unmapped_kmers: n_unmapped_kmers,
+            });
             variant_info.push((se_read.to_string(), variants));
         }
     }
@@ -229,7 +255,8 @@ pub fn call(args: CallArgs) {
             
             let best_genome_filename = &viral_metadata.files[best_genome_index as usize].name;
             info!("Selected a representative genome: {}", best_genome_filename);
-            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped_r1 + n_perfect_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_variant_mapped_r1+n_variant_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, (unique_counted_kmer_r1 + unique_counted_kmer_r2)-(n_perfect_mapped_r1+n_perfect_mapped_r2)-(n_variant_mapped_r1 + n_variant_mapped_r2), ); 
+            let n_unmapped_kmers = (unique_counted_kmer_r1 + unique_counted_kmer_r2)-(n_perfect_mapped_r1+n_perfect_mapped_r2)-(n_variant_mapped_r1 + n_variant_mapped_r2);
+            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped_r1 + n_perfect_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_variant_mapped_r1+n_variant_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_unmapped_kmers); 
             log_memory_usage(true, &message);
             if ((n_variant_mapped_r1 + n_variant_mapped_r2 + n_perfect_mapped_r1 + n_perfect_mapped_r2) as f64 / ((unique_counted_kmer_r1 as f64) + (unique_counted_kmer_r2 as f64))) < 0.2 {
                 warn!("Percent of kmers found is very low, suggesting a bad reference, a bad sequencing run, contamination in sample, or some other issue")
@@ -241,7 +268,7 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let variants = call_variants(
+            let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
                 &args,
                 output,
                 output_counts,
@@ -260,11 +287,24 @@ pub fn call(args: CallArgs) {
             }
             print_output(&r1, &args, &variants, &viral_metadata, &best_genome_index);
 
+            output_info.push(OutputInfo {
+                filename: r1.to_string(),
+                selected_genome: best_genome_filename.to_string(),
+                num_major_variants: num_major_variants,
+                num_minor_variants: num_minor_variants,
+                breadth_coverage: breadth_cov,
+                depth_coverage: depth_cov,
+                num_perfect_kmers: *n_perfect_mapped_r1 + *n_perfect_mapped_r2,
+                num_variant_kmers: *n_variant_mapped_r1 + *n_variant_mapped_r2,
+                num_unmapped_kmers: n_unmapped_kmers,
+            });
             variant_info.push((r1.to_string(), variants));
 
         }
     }
 
+    info!("Printing overview");
+    print_output_info(&args, output_info);
     info!("All samples processed successfully");
 
     // NEED TO UPDATE: PRINT OUT THE ALIGNMENT BY GENOME SELECTED (may be more than 1)
@@ -474,6 +514,43 @@ pub fn print_pileup(
 }
 
 
+pub fn print_output_info(args: &CallArgs, output_info: Vec<OutputInfo>) {
+    let file_stem = "bronko_overview";
+    let output = &args.output;
+    let path = format!("{}/{}.tsv", output, file_stem);
+
+    let tsv_file = File::create(&path).unwrap_or_else(|e| {
+        error!("{} | Failed to create tsv file", e);
+        std::process::exit(1);
+    });
+
+    let mut writer = BufWriter::new(tsv_file);
+
+    // header
+    writeln!(
+        writer,
+        "filename\tselected_genome\tnum_major_variants\tnum_minor_variants\tbreadth_coverage\tdepth_coverage\tnum_perfect_kmers\tnum_variant_kmers\tnum_unmapped_kmers"
+    ).unwrap();
+
+    // rows
+    for info in output_info {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            info.filename,
+            info.selected_genome,
+            info.num_major_variants,
+            info.num_minor_variants,
+            info.breadth_coverage,
+            info.depth_coverage,
+            info.num_perfect_kmers,
+            info.num_variant_kmers,
+            info.num_unmapped_kmers
+        ).unwrap();
+    }
+}
+
+
 pub fn print_output(
     read_output: &String,
     args: &CallArgs, 
@@ -540,14 +617,20 @@ pub fn call_variants(
     filter_end_seq: bool,
     strand_filter: bool,
     n_kmer_per_strand: usize,
-) -> Vec<VCFRecord> {
+) -> (Vec<VCFRecord>, usize, usize, f64, f64) {
 
     info!("Calling variants for [replace w filename]");
 
     let mut results: Vec<VCFRecord> = Vec::new();
 
+    // overall variant calling statitics for sample
     let mut num_minor_variants = 0;
     let mut num_major_variants = 0;
+
+    // overall mapping statistics for sample
+    let mut positions_covered: usize = 0; //number of positions with any coverage (used for breadth of coverage)
+    let mut total_positions: usize = 0; //length across all sequences
+    let mut total_coverage: usize = 0; //total depth across all positions (is averaged out below to get depth of coverage)
 
     for seq_entry in output.iter(){
         let seq = seq_entry.key();
@@ -567,6 +650,10 @@ pub fn call_variants(
             end = len - args.kmer;
         }
 
+        //add length to total_positions
+        total_positions += len as usize;
+
+        //loop through positions
         for i in start..end {
             let row = fwd.counts[i];
             let row_rev = rev.counts[i];
@@ -600,6 +687,9 @@ pub fn call_variants(
             let total_depth = row_total.iter().sum();
             if total_depth == 0 {
                 continue; //maybe replace down the line with logic to fix things
+            } else {
+                positions_covered += 1;
+                total_coverage += total_depth as usize;
             }
 
             // loop through each base and variant call if not the reference base
@@ -665,8 +755,11 @@ pub fn call_variants(
 
     }
 
-    info!("Called {} minor + {} major variants above maf={}", num_minor_variants, num_major_variants, min_af);
-    results
+    let breadth_cov: f64 = positions_covered as f64 / total_positions as f64;
+    let depth_cov: f64 = total_coverage as f64 / positions_covered as f64;
+    info!("Sample breadth of coverage: {}, depth of coverage: {}", breadth_cov, depth_cov);
+    info!("Called {} major variants, {} minor above maf = {}", num_major_variants, num_minor_variants, min_af);
+    (results, num_major_variants, num_minor_variants, breadth_cov, depth_cov)
 
 }
 
