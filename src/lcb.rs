@@ -44,7 +44,7 @@ pub fn assign_buckets(kmer: u64, k: usize) -> Vec<u64> {
     buckets
 }
 
-pub fn nt_to_bits(nt: u8) -> u64 {
+pub fn nt_to_bits(nt: u8) -> u8 {
     match nt {
         b'A' | b'a' => 0,
         b'C' | b'c' => 1,
