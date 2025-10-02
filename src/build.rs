@@ -10,14 +10,25 @@ use log::*;
 
 use rustc_hash::{FxHashMap};
 use needletail::{parse_fastx_file};
-
+use bincode::{config, Decode, Encode};
 
 use std::path::Path;
+use std::fs::File;
+
+use std::io::BufWriter;
 
 use rayon::prelude::*;
 
+// the actual database containing k, the index itself, and the metadata
+#[derive(Encode, Decode)]
+pub struct BronkoIndex {
+    pub k: usize,
+    pub global_index: FxHashMap<u64, Vec<BucketInfo>>,
+    pub metadata: ViralMetadata,
+}
 
 // Sequence metadata including name and length (individual segments/chromosomes)
+#[derive(Encode, Decode)]
 pub struct SeqMeta {
     pub name: String,   //fasta header
     pub len: usize,     //length of sequence
@@ -25,19 +36,21 @@ pub struct SeqMeta {
 }
 
 /// Per File metadata with name and sequences (one genome)
+#[derive(Encode, Decode)]
 pub struct FileMeta {
     pub name: String, //name of the file
     pub sequences: Vec<SeqMeta>, //sequences within the file (for segmented viruses, incomplete assemblies, etc)
 }
 
 /// All metadata (collection of all genomes in the index)
+#[derive(Encode, Decode)]
 pub struct ViralMetadata {  
     pub files: Vec<FileMeta>,   //list of all files
     pub k: usize, //kmer size used in the index
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Encode, Decode, Debug, Clone, Copy)]
 pub struct BucketInfo {
     pub file_id: u16, //index storing the filename 
     pub seq_id: u8, //index storing the sequence
@@ -97,6 +110,33 @@ pub fn build(args: BuildArgs) {
         std::process::exit(1)
     });
     log_memory_usage(true, "Fasta files indexed successfully");
+
+    let output_path = &format!("{}{}", &args.output, ".bkdb");
+    info!("Saving index to {}", output_path);
+    save_index(output_path, args.kmer, ref_index, viral_metadata);
+}
+
+pub fn save_index(
+    file_path: &str,
+    k: usize,
+    global_index: FxHashMap<u64, Vec<BucketInfo>>,
+    metadata: ViralMetadata,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::create(file_path).unwrap_or_else(|e|{
+        error!("{} | File path {} not valid", e, file_path);
+        std::process::exit(1);
+    });
+    let mut writer = BufWriter::new(file);
+
+    let db = BronkoIndex {
+        k,
+        global_index,
+        metadata,
+    };
+
+    let config = config::standard();
+    bincode::encode_into_std_write(&db, &mut writer, config).unwrap();
+    Ok(())
 }
 
 pub fn build_indexes(

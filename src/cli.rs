@@ -42,7 +42,7 @@ pub struct BuildArgs {
     pub kmer: usize,
 
     //OUTPUT 
-    #[clap(short='o', long="output", default_value = DEFAULT_INDEX_OUTPUT, help_heading="OUTPUT", help="Name of index file (.bki will be added)")]
+    #[clap(short='o', long="output", default_value = DEFAULT_INDEX_OUTPUT, help_heading="OUTPUT", help="Name of index file (.bkdb will be added)")]
     pub output: String,
 
     // OTHER PARAMETERS
@@ -64,10 +64,11 @@ pub struct BuildArgs {
 pub struct CallArgs {
 
     // REFERENCE INPUT
-    #[clap(num_args=1.., short='g', long = "genomes", help_heading = "REFERENCE INPUT", help = "Genome fasta(.gz) files to use as references")]
-    pub genomes: Vec<String>,
+    #[clap(num_args=1.., short='g', long = "genomes", help_heading = "REFERENCE INPUT", help = "Genome fasta(.gz) files to use as references (bronko build will be called)")]
+    pub genomes: Option<Vec<String>>,
 
-    // todo: add database version (pre built)
+    #[clap(short='d', long= "db", help_heading="REFERENCE INPUT", help = "Use a prebuilt bronko db (.bkdb) of genomes of interest")]
+    pub db: Option<String>, 
 
     // SEQUENCING DATA INPUT
     #[clap(num_args=1.., short = 'r', long = "reads", help_heading = "READS INPUT", help = "Input single-end reads (fastq/gzip)")]

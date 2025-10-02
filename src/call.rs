@@ -10,6 +10,7 @@ use log::*;
 use crate::consts::*;
 use rustc_hash::{FxHashMap};
 use dashmap::DashMap;
+use bincode::{config};
 
 use std::fs::File;
 use std::vec;
@@ -54,10 +55,20 @@ fn check_args(args: &CallArgs) {
         }
     }
 
-    for fasta_file in &args.genomes {
-        if !check_fasta(&fasta_file){
-            error!("{} does not appear to be a fasta file (must be .fa(.gz)/.fasta(.gz)/.fna(.gz))", &fasta_file);
-            std::process::exit(1)
+    if args.genomes.is_some() && args.db.is_some() {
+        error!("Please provide either a db or the genomes you would like to index, not both.");
+        std::process::exit(1);
+    } else if args.genomes.is_none() && args.db.is_none() {
+        error!("Please provide either a db or the genomes you would like to index.");
+        std::process::exit(1);
+    }
+
+    if let Some(genomes) =  &args.genomes {
+        for fasta_file in genomes {
+            if !check_fasta(&fasta_file){
+                error!("{} does not appear to be a fasta file (must be .fa(.gz)/.fasta(.gz)/.fna(.gz))", &fasta_file);
+                std::process::exit(1)
+            }
         }
     }
 
@@ -97,6 +108,7 @@ fn check_args(args: &CallArgs) {
     //     println!("{}, {}", r1, r2)
     // }
 
+
 }
 
 #[derive(Debug)]
@@ -123,12 +135,45 @@ pub fn call(args: CallArgs) {
     fs::create_dir(out_path);
     fs::create_dir(out_path.join("tmp"));
 
+    let (mut ref_index, mut viral_metadata);
+
+    
     //build the indexes
-    let (ref_index, viral_metadata): (FxHashMap<u64, Vec<BucketInfo>>, ViralMetadata) = build_indexes(args.kmer, &args.genomes).unwrap_or_else(|e| {
-        error!("{} | Reference failed to build", e);
-        std::process::exit(1)
-    });
-    log_memory_usage(true, "Fasta files indexed successfully. Starting counting kmers ");
+    if let Some(genomes) = &args.genomes {
+        info!("Creating bronko index from provided reference genomes");
+        let (index, meta): (FxHashMap<u64, Vec<BucketInfo>>, ViralMetadata) = build_indexes(args.kmer, &genomes).unwrap_or_else(|e| {
+            error!("{} | Reference failed to build", e);
+            std::process::exit(1)
+        });
+        ref_index = index;
+        viral_metadata = meta;
+        log_memory_usage(true, "Fasta files indexed successfully. Starting counting kmers ");
+    } else if let Some(db) = &args.db {
+        info!("Reading in provided bronko index");
+        let file = File::open(&db).unwrap_or_else(|e| {
+            error!("Failed to open file '{}': {}", &db, e);
+            std::process::exit(1);
+        });
+
+        let mut reader = BufReader::new(file);
+        let config = config::standard();
+        let db: BronkoIndex = bincode::decode_from_std_read(&mut reader, config).unwrap_or_else(|e| {
+            error!("Failed to read Bronko Index from '{}': {}", db, e);
+            std::process::exit(1);
+        });
+
+        let db_k = db.k;
+        if db_k != args.kmer {
+            error!("Database k is not the same as provided, please set -k to {} or build a new index", {db_k});
+            std::process::exit(1);
+        }
+        
+        ref_index = db.global_index;
+        viral_metadata = db.metadata;
+    } else {
+        error!("Unable to build/read index, exiting");
+        std::process::exit(1);
+    }
 
     // storing the variant information
     let total_samples = args.reads.len() + args.first_pairs.len();
@@ -376,74 +421,74 @@ pub fn pick_best_genome_paired(
         .map(|(file_index, _)| *file_index)
 }
 
-pub fn build_alignment_fasta(
-    sample_variants: Vec<(String, Vec<VCFRecord>)>,
-    args: &CallArgs
-) {
+// pub fn build_alignment_fasta(
+//     sample_variants: Vec<(String, Vec<VCFRecord>)>,
+//     args: &CallArgs
+// ) {
         
-    //first collect all sequence/position pairs with a variant and their reference base, as well as a local version for each sample
-    let mut all_positions: FxHashMap<(String, usize), u8> = FxHashMap::default();
-    let mut sample_positions: FxHashMap<String, FxHashMap<(String, usize), u8>> = FxHashMap::default();
+//     //first collect all sequence/position pairs with a variant and their reference base, as well as a local version for each sample
+//     let mut all_positions: FxHashMap<(String, usize), u8> = FxHashMap::default();
+//     let mut sample_positions: FxHashMap<String, FxHashMap<(String, usize), u8>> = FxHashMap::default();
 
-    for (sample, vcf_records) in &sample_variants {
-        sample_positions.insert(sample.clone(), FxHashMap::default());
-        for variant in vcf_records {
-            if variant.af >= 0.5 { //store the major variants in the full set and the sample set
-                all_positions.insert((variant.seq.clone(), variant.pos), variant.ref_base);
-                if let Some(sample_map) = sample_positions.get_mut(&sample.clone()) {
-                    sample_map.insert((variant.seq.clone(), variant.pos), variant.alt_base);
-                }
-            }
-        }
-    }
+//     for (sample, vcf_records) in &sample_variants {
+//         sample_positions.insert(sample.clone(), FxHashMap::default());
+//         for variant in vcf_records {
+//             if variant.af >= 0.5 { //store the major variants in the full set and the sample set
+//                 all_positions.insert((variant.seq.clone(), variant.pos), variant.ref_base);
+//                 if let Some(sample_map) = sample_positions.get_mut(&sample.clone()) {
+//                     sample_map.insert((variant.seq.clone(), variant.pos), variant.alt_base);
+//                 }
+//             }
+//         }
+//     }
 
-    // then sort all global positions such that they are ordered by seq and position
-    let mut positions: Vec<(String, usize)> = all_positions.keys().cloned().collect();
-    positions.sort_unstable();
+//     // then sort all global positions such that they are ordered by seq and position
+//     let mut positions: Vec<(String, usize)> = all_positions.keys().cloned().collect();
+//     positions.sort_unstable();
 
-    // now just loop through each position for each sample, and each time output a string if that variant is present (or the reference if not)
-    let fasta_out = File::create(format!("{}/alignment.mfa", args.output)).unwrap_or_else(|e| {
-        error!("{} | Failed to create mfa alignment file", e);
-        std::process::exit(1);
-    });
-    let mut writer = BufWriter::new(fasta_out);
+//     // now just loop through each position for each sample, and each time output a string if that variant is present (or the reference if not)
+//     let fasta_out = File::create(format!("{}/alignment.mfa", args.output)).unwrap_or_else(|e| {
+//         error!("{} | Failed to create mfa alignment file", e);
+//         std::process::exit(1);
+//     });
+//     let mut writer = BufWriter::new(fasta_out);
 
-    // Output the reference sequence first
-    let mut ref_seq = String::with_capacity(positions.len());
-    for pos_key in &positions {
-        let ref_base = all_positions
-            .get(pos_key)
-            .map(|&b| nucleotide_bits_to_char(b as u64))
-            .unwrap_or('N');
-        ref_seq.push(ref_base);
-    }
-    writeln!(writer, ">{}", args.genomes[0]).unwrap();
-    writeln!(writer, "{}", ref_seq).unwrap();
+//     // Output the reference sequence first
+//     let mut ref_seq = String::with_capacity(positions.len());
+//     for pos_key in &positions {
+//         let ref_base = all_positions
+//             .get(pos_key)
+//             .map(|&b| nucleotide_bits_to_char(b as u64))
+//             .unwrap_or('N');
+//         ref_seq.push(ref_base);
+//     }
+//     writeln!(writer, ">{}", args.genomes[0]).unwrap();
+//     writeln!(writer, "{}", ref_seq).unwrap();
 
-    for (sample_name, sample_map) in &sample_positions {
-        let mut seq = String::with_capacity(positions.len());
+//     for (sample_name, sample_map) in &sample_positions {
+//         let mut seq = String::with_capacity(positions.len());
 
-        for pos_key in &positions {
-            // If the sample has a variant at this position, use the alt_base
-            if let Some(&alt_base) = sample_map.get(pos_key) {
-                seq.push(nucleotide_bits_to_char(alt_base as u64)); // u8 → char
-            } else {
-                // Otherwise fall back to reference base from all_positions
-                let ref_base = all_positions
-                    .get(pos_key)
-                    .map(|&b| nucleotide_bits_to_char(b as u64))
-                    .unwrap_or('N');
-                seq.push(ref_base);
-            }
-        }
+//         for pos_key in &positions {
+//             // If the sample has a variant at this position, use the alt_base
+//             if let Some(&alt_base) = sample_map.get(pos_key) {
+//                 seq.push(nucleotide_bits_to_char(alt_base as u64)); // u8 → char
+//             } else {
+//                 // Otherwise fall back to reference base from all_positions
+//                 let ref_base = all_positions
+//                     .get(pos_key)
+//                     .map(|&b| nucleotide_bits_to_char(b as u64))
+//                     .unwrap_or('N');
+//                 seq.push(ref_base);
+//             }
+//         }
 
-        let sample_out = clean_sample_id(&sample_name);
+//         let sample_out = clean_sample_id(&sample_name);
 
-        writeln!(writer, ">{}", sample_out).unwrap();
-        writeln!(writer, "{}", seq).unwrap();
-    }
+//         writeln!(writer, ">{}", sample_out).unwrap();
+//         writeln!(writer, "{}", seq).unwrap();
+//     }
 
-}
+// }
 
 pub fn get_kmers(reads_file: &String, threads: &usize, args:&CallArgs) -> (Vec<(String, u64)>, usize, usize, usize, usize){
     //count kmers using kmc3
@@ -536,7 +581,7 @@ pub fn print_output_info(args: &CallArgs, output_info: Vec<OutputInfo>) {
     for info in output_info {
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{}",
             info.filename,
             info.selected_genome,
             info.num_major_variants,
