@@ -22,7 +22,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Mode {
-    //end-to-end --> runs everything
     Build(BuildArgs), //Build --> parses a genome(s) and builds the data strucutre that we want to map to later
     Call(CallArgs), //Call --> takes the genomes and sequencing data and does the viral variation analysis
 }
@@ -132,6 +131,9 @@ pub struct CallArgs {
 
     #[clap(long="alignment", default_value_t = DEFAULT_ALIGNMENT, help_heading="EXTRA OUTPUT FILES", help="Output an multifasta containing the alignment of all samples to the reference and themselves (only major variant positions)")]
     pub output_alignment: bool,
+
+    #[clap(long="keep-kmer-info", default_value_t = DEFAULT_KEEP_KMER_INFO, help_heading="EXTRA OUTPUT FILES", help="Keep kmer count information and temporary files (deleted by default)")]
+    pub keep_kmer_counts: bool, 
 
     // OTHER PARAMETERS
     //Number of threads

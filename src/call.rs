@@ -257,6 +257,10 @@ pub fn call(args: CallArgs) {
                 num_unmapped_kmers: n_unmapped_kmers,
             });
             variant_info.push((se_read.to_string(), variants));
+
+            if !args.keep_kmer_counts {
+                cleanup_kmc_files(&args.output);
+            }
         }
     }
 
@@ -344,20 +348,46 @@ pub fn call(args: CallArgs) {
                 num_unmapped_kmers: n_unmapped_kmers,
             });
             variant_info.push((r1.to_string(), variants));
-
+            
+            
+            if !args.keep_kmer_counts {
+                cleanup_kmc_files(&args.output);
+            }
         }
     }
 
     info!("Printing overview");
-    print_output_info(&args, output_info);
+    print_output_info(&args, &output_info);
     info!("All samples processed successfully");
 
-    // NEED TO UPDATE: PRINT OUT THE ALIGNMENT BY GENOME SELECTED (may be more than 1)
-    // if args.output_alignment {
-    //     info!("Building alignment");
-    //     build_alignment_fasta(variant_info, &args);
-    // }
+    //Printing out alignments
+    if args.output_alignment {
+        info!("Building alignment(s)");
+        build_alignments_for_genomes(&output_info, &variant_info, &viral_metadata, &args);
+    }
 
+    fs::remove_dir_all(format!("{}/tmp", args.output)).ok();
+    info!("");
+    info!("bronko complete!");
+
+}
+
+fn cleanup_kmc_files(output_dir: &str) {
+    if let Ok(entries) = fs::read_dir(output_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.ends_with("kmc_pre")
+                    || name.ends_with("kmc_suf")
+                    || name.ends_with("_counts.txt")
+                {
+                    if let Err(e) = fs::remove_file(&path) {
+                        eprintln!("Failed to delete {:?}: {}", path, e);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub fn pick_best_genome(mapping_data: &FxHashMap<u16, (usize, usize)>) -> Option<u16> {
@@ -421,74 +451,131 @@ pub fn pick_best_genome_paired(
         .map(|(file_index, _)| *file_index)
 }
 
-// pub fn build_alignment_fasta(
-//     sample_variants: Vec<(String, Vec<VCFRecord>)>,
-//     args: &CallArgs
-// ) {
+pub fn build_alignments_for_genomes(
+    output_info: &Vec<OutputInfo>,
+    variant_info: &Vec<(String, Vec<VCFRecord>)>,
+    viral_metadata: &ViralMetadata,
+    args: &CallArgs,
+) {
+    // Build fast lookup for variants
+    let mut variant_map: FxHashMap<&str, &Vec<VCFRecord>> = FxHashMap::default();
+    for (fname, vars) in variant_info {
+        variant_map.insert(fname.as_str(), vars);
+    }
+
+    // Group by selected_genome (the best genomes for each samples)
+    let mut genome_map: FxHashMap<String, Vec<(String, Vec<VCFRecord>)>> = FxHashMap::default();
+
+    // loop through the output_info and append from the variant_map
+    for oi in output_info {
+
+        if oi.breadth_coverage < 0.90 { // don't add genomes with low coverage to the alignment
+            info!("Skipping {} (breadth of coverage = {})", oi.filename, oi.breadth_coverage);
+            continue;
+        }
+
+        if let Some(vars) = variant_map.get(oi.filename.as_str()) {
+            genome_map
+                .entry(oi.selected_genome.clone())
+                .or_default()
+                .push((oi.filename.clone(), (*vars).clone()));
+        } else {
+            warn!("No variant info found for {}", oi.filename);
+        }
+    }
+
+    // For each genome with ≥3 samples, build alignment
+    for (genome_name, samples) in genome_map {
+        if samples.len() < 3 {
+            info!("Skipping {} (only {} samples)", genome_name, samples.len());
+            continue;
+        }
+
+        // Find genome metadata in viral_metadata
+        if let Some(file_meta) = viral_metadata.files.iter().find(|f| f.name == genome_name) {
+            info!(
+                "Building alignment for genome {} with {} samples",
+                genome_name,
+                samples.len()
+            );
+            build_alignment_fasta(samples, args, file_meta);
+        } else {
+            warn!("Genome {} not found in metadata, skipping", genome_name);
+        }
+    }
+}
+
+
+
+pub fn build_alignment_fasta(
+    sample_variants: Vec<(String, Vec<VCFRecord>)>,
+    args: &CallArgs,
+    file_meta: &FileMeta,
+) {
         
-//     //first collect all sequence/position pairs with a variant and their reference base, as well as a local version for each sample
-//     let mut all_positions: FxHashMap<(String, usize), u8> = FxHashMap::default();
-//     let mut sample_positions: FxHashMap<String, FxHashMap<(String, usize), u8>> = FxHashMap::default();
+    //first collect all sequence/position pairs with a variant and their reference base, as well as a local version for each sample
+    let mut all_positions: FxHashMap<(String, usize), u8> = FxHashMap::default();
+    let mut sample_positions: FxHashMap<String, FxHashMap<(String, usize), u8>> = FxHashMap::default();
 
-//     for (sample, vcf_records) in &sample_variants {
-//         sample_positions.insert(sample.clone(), FxHashMap::default());
-//         for variant in vcf_records {
-//             if variant.af >= 0.5 { //store the major variants in the full set and the sample set
-//                 all_positions.insert((variant.seq.clone(), variant.pos), variant.ref_base);
-//                 if let Some(sample_map) = sample_positions.get_mut(&sample.clone()) {
-//                     sample_map.insert((variant.seq.clone(), variant.pos), variant.alt_base);
-//                 }
-//             }
-//         }
-//     }
+    for (sample, vcf_records) in &sample_variants {
+        sample_positions.insert(sample.clone(), FxHashMap::default());
+        for variant in vcf_records {
+            if variant.af >= 0.5 { //store the major variants in the full set and the sample set
+                all_positions.insert((variant.seq.clone(), variant.pos), variant.ref_base);
+                if let Some(sample_map) = sample_positions.get_mut(&sample.clone()) {
+                    sample_map.insert((variant.seq.clone(), variant.pos), variant.alt_base);
+                }
+            }
+        }
+    }
 
-//     // then sort all global positions such that they are ordered by seq and position
-//     let mut positions: Vec<(String, usize)> = all_positions.keys().cloned().collect();
-//     positions.sort_unstable();
+    // then sort all global positions such that they are ordered by seq and position
+    let mut positions: Vec<(String, usize)> = all_positions.keys().cloned().collect();
+    positions.sort_unstable();
 
-//     // now just loop through each position for each sample, and each time output a string if that variant is present (or the reference if not)
-//     let fasta_out = File::create(format!("{}/alignment.mfa", args.output)).unwrap_or_else(|e| {
-//         error!("{} | Failed to create mfa alignment file", e);
-//         std::process::exit(1);
-//     });
-//     let mut writer = BufWriter::new(fasta_out);
+    // now just loop through each position for each sample, and each time output a string if that variant is present (or the reference if not)
+    let fasta_out = File::create(format!("{}/{}.mfa", args.output, file_meta.name)).unwrap_or_else(|e| {
+        error!("{} | Failed to create mfa alignment file", e);
+        std::process::exit(1);
+    });
+    let mut writer = BufWriter::new(fasta_out);
 
-//     // Output the reference sequence first
-//     let mut ref_seq = String::with_capacity(positions.len());
-//     for pos_key in &positions {
-//         let ref_base = all_positions
-//             .get(pos_key)
-//             .map(|&b| nucleotide_bits_to_char(b as u64))
-//             .unwrap_or('N');
-//         ref_seq.push(ref_base);
-//     }
-//     writeln!(writer, ">{}", args.genomes[0]).unwrap();
-//     writeln!(writer, "{}", ref_seq).unwrap();
+    // Output the reference sequence first
+    let mut ref_seq = String::with_capacity(positions.len());
+    for pos_key in &positions {
+        let ref_base = all_positions
+            .get(pos_key)
+            .map(|&b| nucleotide_bits_to_char(b as u64))
+            .unwrap_or('N');
+        ref_seq.push(ref_base);
+    }
+    writeln!(writer, ">{}", file_meta.name).unwrap();
+    writeln!(writer, "{}", ref_seq).unwrap();
 
-//     for (sample_name, sample_map) in &sample_positions {
-//         let mut seq = String::with_capacity(positions.len());
+    for (sample_name, sample_map) in &sample_positions {
+        let mut seq = String::with_capacity(positions.len());
 
-//         for pos_key in &positions {
-//             // If the sample has a variant at this position, use the alt_base
-//             if let Some(&alt_base) = sample_map.get(pos_key) {
-//                 seq.push(nucleotide_bits_to_char(alt_base as u64)); // u8 → char
-//             } else {
-//                 // Otherwise fall back to reference base from all_positions
-//                 let ref_base = all_positions
-//                     .get(pos_key)
-//                     .map(|&b| nucleotide_bits_to_char(b as u64))
-//                     .unwrap_or('N');
-//                 seq.push(ref_base);
-//             }
-//         }
+        for pos_key in &positions {
+            // If the sample has a variant at this position, use the alt_base
+            if let Some(&alt_base) = sample_map.get(pos_key) {
+                seq.push(nucleotide_bits_to_char(alt_base as u64)); // u8 → char
+            } else {
+                // Otherwise fall back to reference base from all_positions
+                let ref_base = all_positions
+                    .get(pos_key)
+                    .map(|&b| nucleotide_bits_to_char(b as u64))
+                    .unwrap_or('N');
+                seq.push(ref_base);
+            }
+        }
 
-//         let sample_out = clean_sample_id(&sample_name);
+        let sample_out = clean_sample_id(&sample_name);
 
-//         writeln!(writer, ">{}", sample_out).unwrap();
-//         writeln!(writer, "{}", seq).unwrap();
-//     }
+        writeln!(writer, ">{}", sample_out).unwrap();
+        writeln!(writer, "{}", seq).unwrap();
+    }
 
-// }
+}
 
 pub fn get_kmers(reads_file: &String, threads: &usize, args:&CallArgs) -> (Vec<(String, u64)>, usize, usize, usize, usize){
     //count kmers using kmc3
@@ -559,7 +646,7 @@ pub fn print_pileup(
 }
 
 
-pub fn print_output_info(args: &CallArgs, output_info: Vec<OutputInfo>) {
+pub fn print_output_info(args: &CallArgs, output_info: &Vec<OutputInfo>) {
     let file_stem = "bronko_overview";
     let output = &args.output;
     let path = format!("{}/{}.tsv", output, file_stem);
@@ -636,7 +723,7 @@ pub fn print_output(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VCFRecord{
     seq: String,
     pos: usize,
