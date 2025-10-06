@@ -1,6 +1,6 @@
 pub const BRONKO_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const MIN_KMER_SIZE: usize = 5;
-pub const DEFAULT_KMER_SIZE: usize = 19; //kmer size
+pub const MIN_KMER_SIZE: usize = 15;
+pub const DEFAULT_KMER_SIZE: usize = 21; //kmer size
 pub const MAX_KMER_SIZE: usize = 31;
 pub const MIN_KMER_COUNT: usize = 10; // minimum number of times a kmer must occur to be run through algorithm
 pub const DEFAULT_MIN_AF: f64 = 0.03; // minimum allele frequency to be reported
@@ -13,5 +13,5 @@ pub const DEFAULT_ALIGNMENT: bool = false;
 pub const DEFAULT_KEEP_KMER_INFO: bool = false;
 pub const DEFAULT_N_FIXED: usize = 2;   //number of fixed bases in the kmer
 pub const DEFAULT_USE_FULL_KMER: bool = false;  //use the full length of the kmer
-pub const DEFAULT_MIN_DEPTH: usize = MIN_KMER_COUNT*100;
+pub const DEFAULT_MIN_DEPTH: usize = MIN_KMER_COUNT*50;
 pub const DEFAULT_INDEX_OUTPUT: &str = "bronko";
