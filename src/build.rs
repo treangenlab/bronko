@@ -113,7 +113,10 @@ pub fn build(args: BuildArgs) {
 
     let output_path = &format!("{}{}", &args.output, ".bkdb");
     info!("Saving index to {}", output_path);
-    save_index(output_path, args.kmer, ref_index, viral_metadata);
+    save_index(output_path, args.kmer, ref_index, viral_metadata).unwrap_or_else(|e|{
+        error!("{} | Unable to save index", e);
+        std::process::exit(1);
+    });
 }
 
 pub fn save_index(

@@ -132,10 +132,16 @@ pub fn call(args: CallArgs) {
 
     // create output directory
     let out_path = Path::new(&args.output);
-    fs::create_dir(out_path);
-    fs::create_dir(out_path.join("tmp"));
+    fs::create_dir(out_path).unwrap_or_else(|e| {
+        error!("{} | Unable to create outputs in output directory", e);
+        std::process::exit(1);
+    });
+    fs::create_dir(out_path.join("tmp")).unwrap_or_else(|e| {
+        error!("{} | Unable to create outputs in output directory", e);
+        std::process::exit(1);
+    });
 
-    let (mut ref_index, mut viral_metadata);
+    let (ref_index, viral_metadata);
 
     
     //build the indexes
@@ -620,7 +626,6 @@ pub fn print_pileup(
 
     for seq_entry in &file_meta.sequences {
         let seq = &seq_entry.name;
-        let seq_len = seq_entry.len;
 
         let fwd = output.get(seq).expect("Could not match seq to fwd counts");
         let rev = output_rev.get(seq).expect("Could not match seq to rev counts");
@@ -830,14 +835,14 @@ pub fn call_variants(
                     continue;
                 }
 
-                /// Strand filter logic
-                /// 
-                /// If the depths are uneven (one is <min_depth_percent% of the total_depth by default)
-                /// then only one of the two strands must pass the n_kmer_per_strand (likely the dominant one)
-                /// otherwise both must pass that filter. 
-                /// 
-                /// If there is no stand filter, then it does not matter, you just let everything pass with the same logic  
-                /// 
+                // Strand filter logic
+                // 
+                // If the depths are uneven (one is <min_depth_percent% of the total_depth by default)
+                // then only one of the two strands must pass the n_kmer_per_strand (likely the dominant one)
+                // otherwise both must pass that filter. 
+                // 
+                // If there is no stand filter, then it does not matter, you just let everything pass with the same logic  
+                // 
                 let pass_strand_filter = if strand_filter {
                     if min_depth_strand as f64 >= percent_strand_depth * max_depth_strand as f64 {
                         count[alt_base as usize] as usize >= n_kmer_per_strand && count_rev[alt_base as usize] as usize >= n_kmer_per_strand
@@ -1022,8 +1027,6 @@ pub fn map_kmers(
             let (kmer_bin, rc) = canonical_kmer(kmer.as_bytes(), k);
             let buckets = assign_buckets(kmer_bin, k);
 
-            let mut found_buckets = 0;
-
             let filtered_buckets = if args.use_full_kmer {
                 buckets
             } else {
@@ -1035,13 +1038,12 @@ pub fn map_kmers(
                 }
             };
 
-            let mut num_buckets_perfect = filtered_buckets.len();
+            let num_buckets_perfect = filtered_buckets.len();
             let mut per_genome_bucket_hits: FxHashMap<u16, usize> = FxHashMap::default(); //number of hits to each genome (where the key is the index of the file) per kmer
 
             for &bucket in &filtered_buckets {
 
                 if let Some(bucket_infos) = index.get(&bucket) {
-                    found_buckets += 1;
 
                     for info in bucket_infos {
                         // NEED TO UPDATE TO FILTER OUT DUPLICATE BUCKETS IN GENOMES
