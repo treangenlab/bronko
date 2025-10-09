@@ -117,7 +117,7 @@ pub struct CallArgs {
     pub min_strand_diff: f64,
 
     //min depth to call a variant
-    #[clap(long="min-depth", default_value_t = DEFAULT_MIN_DEPTH, help_heading="VARIANT CALLING PARAMETERS", help="Minimum depth at an allele to call a minor variant (default=100*min_kmers)")]
+    #[clap(long="min-depth", default_value_t = DEFAULT_MIN_DEPTH, help_heading="VARIANT CALLING PARAMETERS", help="Minimum depth at an allele to call a minor variant (default=50*min_kmers)")]
     pub min_depth: usize,
 
     //OUTPUT PARAMETERS
