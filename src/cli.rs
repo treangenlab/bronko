@@ -27,7 +27,7 @@ pub enum Mode {
 }
 
 #[derive(Args, Default)]
-#[clap(about="Create an bronko index of existing viral references for a given species")]
+#[clap(about="Create an bronko index of existing viral references for a given species", arg_required_else_help = true)]
 pub struct BuildArgs {
 
     //REFERENCE INPUT
@@ -59,7 +59,7 @@ pub struct BuildArgs {
 }
 
 #[derive(Args)]
-#[clap(about="Perform rapid viral variant calling of viral sequencing data")]
+#[clap(about="Perform rapid viral variant calling of viral sequencing data", arg_required_else_help = true)]
 pub struct CallArgs {
 
     // REFERENCE INPUT
@@ -122,7 +122,7 @@ pub struct CallArgs {
 
     //OUTPUT PARAMETERS
     //todo add output locations, output formats
-    #[clap(long="output", help_heading="OUTPUT", help="Folder to output all resulting files")]
+    #[clap(long="output", help_heading="OUTPUT", default_value = DEFAULT_OUT_FOLDER, help="Folder to output all resulting files")]
     pub output: String,
 
     //EXTRA OUTPUT FORMATS

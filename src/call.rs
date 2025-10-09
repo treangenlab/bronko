@@ -132,11 +132,12 @@ pub fn call(args: CallArgs) {
 
     // create output directory
     let out_path = Path::new(&args.output);
-    fs::create_dir(out_path).unwrap_or_else(|e| {
-        error!("{} | Unable to create outputs in output directory", e);
+    fs::create_dir_all(out_path).unwrap_or_else(|e| {
+        error!("{} | Unable to create outputs in output directory 2", e);
         std::process::exit(1);
     });
-    fs::create_dir(out_path.join("tmp")).unwrap_or_else(|e| {
+
+    fs::create_dir_all(out_path.join("tmp")).unwrap_or_else(|e| {
         error!("{} | Unable to create outputs in output directory", e);
         std::process::exit(1);
     });
