@@ -93,7 +93,7 @@ pub struct CallArgs {
     pub use_full_kmer: bool,
 
     //number of buckets to ignore on ends of kmers 
-    #[clap(long="n-fixed", default_value_t = DEFAULT_N_FIXED, help_heading="ALGORITHM", help="Number of fied positions at the end of each kmer")]
+    #[clap(long="n-fixed", default_value_t = DEFAULT_N_FIXED, help_heading="ALGORITHM", help="Number of fixed positions at the end of each kmer")]
     pub n_fixed: usize,
 
     //VARIANT CALLING PARAMETERS
