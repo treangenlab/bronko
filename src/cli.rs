@@ -122,7 +122,7 @@ pub struct CallArgs {
 
     //OUTPUT PARAMETERS
     //todo add output locations, output formats
-    #[clap(long="output", help_heading="OUTPUT", default_value = DEFAULT_OUT_FOLDER, help="Folder to output all resulting files")]
+    #[clap(short, long="output", help_heading="OUTPUT", default_value = DEFAULT_OUT_FOLDER, help="Folder to output all resulting files")]
     pub output: String,
 
     //EXTRA OUTPUT FORMATS
