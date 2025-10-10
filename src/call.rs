@@ -906,6 +906,15 @@ pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Resu
     let file_stem = clean_sample_id(&fastq_path);
 
 
+    let output_dir = Path::new(&args.output);
+    let tmp_dir = output_dir.join("tmp");
+    fs::create_dir_all(&tmp_dir)
+        .map_err(|e| format!("Failed to create tmp dir: {}", e))?;
+
+    // make sure parent dir for res_prefix exists
+    fs::create_dir_all(output_dir)
+        .map_err(|e| format!("Failed to create output dir: {}", e))?;
+
     let res_prefix: String= format!("{}/{}.res", args.output, file_stem);
     let kmc_output = Command::new("kmc")
         .args(&[
