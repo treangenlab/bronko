@@ -206,7 +206,7 @@ pub fn call(args: CallArgs) {
 
             //select the best genome from the mapping data
             info!("Selecting the most representative genome");
-            let best_genome_index = pick_best_genome(&mapping_data).unwrap_or_else(|| {
+            let best_genome_index = pick_best_genome(&mapping_data, &viral_metadata).unwrap_or_else(|| {
                 error!("Unable to pick a best genome");
                 std::process::exit(1);
             });
@@ -295,7 +295,7 @@ pub fn call(args: CallArgs) {
             let mapping_data_r2 = map_kmers(&kmers2, &ref_index, &viral_metadata, &half_threads, &args, &output_maps);
 
             info!("Selecting the most representative genome");
-            let best_genome_index = pick_best_genome_paired(&mapping_data_r1, &mapping_data_r2).unwrap_or_else(|| {
+            let best_genome_index = pick_best_genome_paired(&mapping_data_r1, &mapping_data_r2, &viral_metadata).unwrap_or_else(|| {
                 error!("Unable to pick a best genome");
                 std::process::exit(1);
             });
@@ -397,33 +397,43 @@ fn cleanup_kmc_files(output_dir: &str) {
     }
 }
 
-pub fn pick_best_genome(mapping_data: &FxHashMap<u16, (usize, usize)>) -> Option<u16> {
+pub fn pick_best_genome(mapping_data: &FxHashMap<u16, (usize, usize)>, viral_metadata: &ViralMetadata) -> Option<u16> {
     //input data has key of usize that is the index in the Viral Metadata, and value of tuple (usize, usize) with the number of perfectly mapped kmers and variant mapped kmers
-    for (genome, (perfect, variant)) in mapping_data.iter() {
-        let score = 0.8 * (*perfect as f64) + 0.2 * (*variant as f64);
+    // Value tuple: (perfect_kmers, variant_kmers)
+    let mut best_genome: Option<u16> = None;
+    let mut best_score: f64 = 0.0;
+
+    for (file_index, (perfect, variant)) in mapping_data.iter() {
+        let genome_len: usize = viral_metadata.files[*file_index as usize]
+            .sequences
+            .iter()
+            .map(|s| s.len)
+            .sum();
+
+        let score = (*perfect as f64) / (genome_len as f64);
+
         trace!(
-            "Genome {}: perfect={}, variant={}, score={:.2}",
-            genome, perfect, variant, score
+            "Genome {}: perfect={}, variant={}, len={}, score={:.4}",
+            file_index, perfect, variant, genome_len, score
         );
+
+        if score > best_score {
+            best_score = score;
+            best_genome = Some(*file_index);
+        }
     }
-    
-    mapping_data
-        .iter()
-        .max_by(|(_, (p1, v1)), (_, (p2, v2))| {
-            let s1 = 0.8 * (*p1 as f64) + 0.2 * (*v1 as f64);
-            let s2 = 0.8 * (*p2 as f64) + 0.2 * (*v2 as f64);
-            s1.partial_cmp(&s2).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(file_index, _)| *file_index)
+
+    best_genome
 }
 
 pub fn pick_best_genome_paired(
     mapping_data1: &FxHashMap<u16, (usize, usize)>,
     mapping_data2: &FxHashMap<u16, (usize, usize)>,
+    viral_metadata: &ViralMetadata,
 ) -> Option<u16> {
     let mut combined: FxHashMap<u16, (usize, usize)> = FxHashMap::default();
 
-    // Insert everything from mapping_data1
+    // Combine both mapping datasets
     for (&k, (p, v)) in mapping_data1.iter() {
         combined.insert(k, (*p, *v));
     }
@@ -439,23 +449,31 @@ pub fn pick_best_genome_paired(
             .or_insert((*p, *v));
     }
 
-    for (genome, (perfect, variant)) in combined.iter() {
-        let score = 0.8 * (*perfect as f64) + 0.2 * (*variant as f64);
+    //get best genome just like for single end reads
+    let mut best_genome: Option<u16> = None;
+    let mut best_score: f64 = 0.0;
+
+    for (file_index, (perfect, variant)) in combined.iter() {
+        let genome_len: usize = viral_metadata.files[*file_index as usize]
+            .sequences
+            .iter()
+            .map(|s| s.len)
+            .sum();
+
+        let score = (*perfect as f64) / (genome_len as f64);
+
         trace!(
-            "Genome {} (paired): perfect={}, variant={}, score={:.2}",
-            genome, perfect, variant, score
+            "Genome {} (paired): perfect={}, variant={}, len={}, score={:.4}",
+            file_index, perfect, variant, genome_len, score
         );
+
+        if score > best_score {
+            best_score = score;
+            best_genome = Some(*file_index);
+        }
     }
 
-    // Now do the same selection logic as the single-end data the merged data
-    combined
-        .iter()
-        .max_by(|(_, (p1, v1)), (_, (p2, v2))| {
-            let s1 = 0.8 * (*p1 as f64) + 0.2 * (*v1 as f64);
-            let s2 = 0.8 * (*p2 as f64) + 0.2 * (*v2 as f64);
-            s1.partial_cmp(&s2).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(file_index, _)| *file_index)
+    best_genome
 }
 
 pub fn build_alignments_for_genomes(
