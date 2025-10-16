@@ -11,6 +11,7 @@ description = "ultra-rapid mapping-free detection of intrahost variation from vi
 readme = "README.md"
 keywords = ["bioinformatics", "genomics", "sequencing", "k-mer", "viruses"]
 categories = ["command-line-utilities", "science"]
+repository = "https://github.com/treangenlab/bronko"
 
 [dependencies]
 needletail = "0.6.0"
@@ -28,3 +29,8 @@ rustc-hash = "2.1.1"
 fastbloom-rs = "0.5.10"
 dashmap = "6.1.0"
 bincode = "2.0.1"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+tempfile = "3.10"
+serial_test = "3"
