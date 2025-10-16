@@ -12,6 +12,8 @@ fn test_build_4_genomes() {
         .arg("test_data/4_sarscov2/OM223929.1.fasta")
         .arg("test_data/4_sarscov2/ON765678.1.fasta")
         .arg("test_data/4_sarscov2/PX392231.1.fasta")
+        .arg("-t")
+        .arg("2")
         .arg("-o")
         .arg(&output_path)
         .assert()
@@ -32,6 +34,8 @@ fn test_build_single_genome_and_k19() {
             "test_data/HPV16.fa",
             "-k",
             "19",
+            "-t",
+            "2",
             "-o",
             output_path.to_str().unwrap(),
         ])
@@ -48,6 +52,8 @@ fn test_build_single_genome() {
         .args([
             "build",
             "-g",
+            "-t",
+            "2",
             "test_data/HPV16.fa",
         ])
         .assert()
