@@ -7,11 +7,13 @@ authors = [
     "Michael Tisza <michael.tisza@bcm.edu>",
     "Todd Treangen <treangen@rice.edu>",
 ]
+license = "MIT"
 description = "ultra-rapid mapping-free detection of intrahost variation from viral amplicon sequencing data"
 readme = "README.md"
 keywords = ["bioinformatics", "genomics", "sequencing", "k-mer", "viruses"]
 categories = ["command-line-utilities", "science"]
 repository = "https://github.com/treangenlab/bronko"
+homepage = "https://github.com/treangenlab/bronko"
 
 [dependencies]
 needletail = "0.6.0"
