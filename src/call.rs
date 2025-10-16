@@ -19,7 +19,7 @@ use std::fs;
 use rayon::prelude::*;
 use rayon::join;
 
-use std::path::Path;
+use std::path::{Path};
 use std::io::{BufReader, BufRead, BufWriter, Write};
 use std::process::{Command, Stdio};
 
@@ -38,8 +38,6 @@ fn check_args(args: &CallArgs) {
         .with_level(output_level)
         .init()
         .unwrap();
-
-    trace!("{}", args.kmer);
 
     //Check kmer size to make sure it is odd and greater than 3
     if args.kmer % 2 != 1 || args.kmer > MAX_KMER_SIZE || args.kmer < MIN_KMER_SIZE {
@@ -103,11 +101,6 @@ fn check_args(args: &CallArgs) {
         error!("Number of paired end sequences do not match, exiting.");
         std::process::exit(1);
     }
-
-    // for (r1, r2) in args.first_pairs.iter().zip(args.second_pairs.iter()){
-    //     println!("{}, {}", r1, r2)
-    // }
-
 
 }
 
@@ -212,14 +205,14 @@ pub fn call(args: CallArgs) {
             });
 
             //print out the best selected genome and mapping statistics
-            let (n_perfect_mapped, n_variant_mapped) = mapping_data.get(&best_genome_index).unwrap_or_else(|| {
+            let (n_perfect_mapped, n_variant_mapped, n_unique_perfect) = mapping_data.get(&best_genome_index).unwrap_or_else(|| {
                 error!("Error getting mapping statistics for best genome");
                 std::process::exit(1);
             });
             let best_genome_filename = &viral_metadata.files[best_genome_index as usize].name;
             info!("Selected a representative genome: {}", best_genome_filename);
             let n_unmapped_kmers = unique_counted_kmer-n_perfect_mapped-n_variant_mapped;
-            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped, unique_counted_kmer, n_variant_mapped, unique_counted_kmer, n_unmapped_kmers); 
+            let message = format!("Mapped {}/{} kmers perfectly ({} unique among refs), {}/{} had a variant, {} unmapped", n_perfect_mapped, unique_counted_kmer, n_unique_perfect, n_variant_mapped, unique_counted_kmer, n_unmapped_kmers); 
             log_memory_usage(true, &message);
 
             if ((n_variant_mapped + n_perfect_mapped) as f64 / unique_counted_kmer as f64) < 0.2 {
@@ -243,6 +236,7 @@ pub fn call(args: CallArgs) {
                 !args.no_end_filter,
                 !args.no_strand_filter,
                 args.n_per_strand,
+                &best_genome_filename
             );
             log_memory_usage(true, "Called variants successfully");
 
@@ -300,11 +294,11 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let (n_perfect_mapped_r1, n_variant_mapped_r1) = mapping_data_r1.get(&best_genome_index).unwrap_or_else(|| {
+            let (n_perfect_mapped_r1, n_variant_mapped_r1, n_unique_perfect_r1) = mapping_data_r1.get(&best_genome_index).unwrap_or_else(|| {
                 error!("Error getting mapping statistics for best genome");
                 std::process::exit(1);
             });
-            let (n_perfect_mapped_r2, n_variant_mapped_r2) = mapping_data_r2.get(&best_genome_index).unwrap_or_else(|| {
+            let (n_perfect_mapped_r2, n_variant_mapped_r2, n_unique_perfect_r2) = mapping_data_r2.get(&best_genome_index).unwrap_or_else(|| {
                 error!("Error getting mapping statistics for best genome");
                 std::process::exit(1);
             });
@@ -312,7 +306,7 @@ pub fn call(args: CallArgs) {
             let best_genome_filename = &viral_metadata.files[best_genome_index as usize].name;
             info!("Selected a representative genome: {}", best_genome_filename);
             let n_unmapped_kmers = (unique_counted_kmer_r1 + unique_counted_kmer_r2)-(n_perfect_mapped_r1+n_perfect_mapped_r2)-(n_variant_mapped_r1 + n_variant_mapped_r2);
-            let message = format!("Mapped {}/{} kmers perfectly, {}/{} had a variant, {} unmapped", n_perfect_mapped_r1 + n_perfect_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_variant_mapped_r1+n_variant_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_unmapped_kmers); 
+            let message = format!("Mapped {}/{} kmers perfectly ({} unique among references) , {}/{} had a variant, {} unmapped", n_perfect_mapped_r1 + n_perfect_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_unique_perfect_r1 + n_unique_perfect_r2, n_variant_mapped_r1+n_variant_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_unmapped_kmers); 
             log_memory_usage(true, &message);
             if ((n_variant_mapped_r1 + n_variant_mapped_r2 + n_perfect_mapped_r1 + n_perfect_mapped_r2) as f64 / ((unique_counted_kmer_r1 as f64) + (unique_counted_kmer_r2 as f64))) < 0.2 {
                 warn!("Percent of kmers found is very low, suggesting a bad reference, a bad sequencing run, contamination in sample, or some other issue")
@@ -334,6 +328,7 @@ pub fn call(args: CallArgs) {
                 !args.no_end_filter,
                 !args.no_strand_filter,
                 args.n_per_strand,
+                &best_genome_filename,
             );
             log_memory_usage(true, "Called variants successfully");
 
@@ -397,24 +392,25 @@ fn cleanup_kmc_files(output_dir: &str) {
     }
 }
 
-pub fn pick_best_genome(mapping_data: &FxHashMap<u16, (usize, usize)>, viral_metadata: &ViralMetadata) -> Option<u16> {
+pub fn pick_best_genome(mapping_data: &FxHashMap<u16, (usize, usize, usize)>, viral_metadata: &ViralMetadata) -> Option<u16> {
     //input data has key of usize that is the index in the Viral Metadata, and value of tuple (usize, usize) with the number of perfectly mapped kmers and variant mapped kmers
     // Value tuple: (perfect_kmers, variant_kmers)
     let mut best_genome: Option<u16> = None;
     let mut best_score: f64 = 0.0;
 
-    for (file_index, (perfect, variant)) in mapping_data.iter() {
+    for (file_index, (perfect, variant, unique_perfect)) in mapping_data.iter() {
         let genome_len: usize = viral_metadata.files[*file_index as usize]
             .sequences
             .iter()
             .map(|s| s.len)
             .sum();
 
-        let score = (*perfect as f64) / (genome_len as f64);
+        let score = (*perfect as f64) / (genome_len as f64) / 2.0;
 
+        let genome_name: String = viral_metadata.files[*file_index as usize].name.clone();
         trace!(
-            "Genome {}: perfect={}, variant={}, len={}, score={:.4}",
-            file_index, perfect, variant, genome_len, score
+            "Genome {}: perfect={}, variant={}, unique={}, len={}, score={:.4}",
+            genome_name, perfect, variant, unique_perfect, genome_len, score
         );
 
         if score > best_score {
@@ -427,44 +423,46 @@ pub fn pick_best_genome(mapping_data: &FxHashMap<u16, (usize, usize)>, viral_met
 }
 
 pub fn pick_best_genome_paired(
-    mapping_data1: &FxHashMap<u16, (usize, usize)>,
-    mapping_data2: &FxHashMap<u16, (usize, usize)>,
+    mapping_data1: &FxHashMap<u16, (usize, usize, usize)>,
+    mapping_data2: &FxHashMap<u16, (usize, usize, usize)>,
     viral_metadata: &ViralMetadata,
 ) -> Option<u16> {
-    let mut combined: FxHashMap<u16, (usize, usize)> = FxHashMap::default();
+    let mut combined: FxHashMap<u16, (usize, usize, usize)> = FxHashMap::default();
 
     // Combine both mapping datasets
-    for (&k, (p, v)) in mapping_data1.iter() {
-        combined.insert(k, (*p, *v));
+    for (&k, (p, v, u)) in mapping_data1.iter() {
+        combined.insert(k, (*p, *v, *u));
     }
 
     // Add everything from mapping_data2
-    for (&k, (p, v)) in mapping_data2.iter() {
+    for (&k, (p, v, u)) in mapping_data2.iter() {
         combined
             .entry(k)
-            .and_modify(|(cp, cv)| {
+            .and_modify(|(cp, cv, cu)| {
                 *cp += p;
                 *cv += v;
+                *cu += u;
             })
-            .or_insert((*p, *v));
+            .or_insert((*p, *v, *u));
     }
 
     //get best genome just like for single end reads
     let mut best_genome: Option<u16> = None;
     let mut best_score: f64 = 0.0;
 
-    for (file_index, (perfect, variant)) in combined.iter() {
+    for (file_index, (perfect, variant, unique_perfect)) in combined.iter() {
         let genome_len: usize = viral_metadata.files[*file_index as usize]
             .sequences
             .iter()
             .map(|s| s.len)
             .sum();
 
-        let score = (*perfect as f64) / (genome_len as f64);
+        let score = (*perfect as f64) / (genome_len as f64) / 2.0; //divided by 2.0 bc of fwd and reverse
 
+        let genome_name: String = viral_metadata.files[*file_index as usize].name.clone();
         trace!(
-            "Genome {} (paired): perfect={}, variant={}, len={}, score={:.4}",
-            file_index, perfect, variant, genome_len, score
+            "Genome {} (paired): perfect={}, variant={}, unique_perfect={}, len={}, score={:.4}",
+            genome_name, perfect, variant, unique_perfect, genome_len, score
         );
 
         if score > best_score {
@@ -773,9 +771,10 @@ pub fn call_variants(
     filter_end_seq: bool,
     strand_filter: bool,
     n_kmer_per_strand: usize,
+    filename: &String, 
 ) -> (Vec<VCFRecord>, usize, usize, f64, f64) {
 
-    info!("Calling variants for [replace w filename]");
+    info!("Calling variants for {}", filename);
 
     let mut results: Vec<VCFRecord> = Vec::new();
 
@@ -982,7 +981,7 @@ pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Resu
         .map_err(|e| format!("KMC3 tools failed | {}", e))?;
 
     if !kmc_dump_output.status.success(){
-        return Err("KMC3 dump failed".to_string())
+        return Err(format!("KMC3 dump failed | {}", String::from_utf8_lossy(&kmc_dump_output.stderr)))
     }
 
     if let (Some(tr), Some(tk), Some(uk), Some(uck)) = (total_reads, total_kmers, unique_kmers, unique_counted_kmers) {
@@ -1036,19 +1035,19 @@ pub fn map_kmers(
             DashMap<String, OutputData>,
         ),
     >,
-) -> FxHashMap<u16, (usize, usize)> {
+) -> FxHashMap<u16, (usize, usize, usize)> {
     let k = args.kmer;
 
     //to store the number of kmers that are mapped perfectly or with 1-edit distance after all of the chunks
     //key is the index of the file in ViralMetadata, values are number of perfectly mapped and 1-edit distance kmers
-    let results: DashMap<u16, (usize, usize)> = DashMap::new();
+    let results: DashMap<u16, (usize, usize, usize)> = DashMap::new();
 
     let chunk_size = if ((kmers.len() / threads) as usize) < 10000 { (kmers.len() / threads) as usize } else { 10000 };
 
     kmers.par_chunks(chunk_size).for_each(|chunk| {
 
-        //key is the index of the file in ViralMetadata, values are number of perfectly mapped and 1-edit distance kmers
-        let mut local_counts: FxHashMap<u16, (usize, usize)> = FxHashMap::default(); //storing the number of perfectly mapped kmers (buckets found = len(filtered_buckets)) and variant mapped kmers (buckets found = 1) in a given thread
+        //key is the index of the file in ViralMetadata, values are number of perfectly mapped and 1-edit distance kmers and unique perfectly mapped kmers
+        let mut local_counts: FxHashMap<u16, (usize, usize, usize)> = FxHashMap::default(); //storing the number of perfectly mapped kmers (buckets found = len(filtered_buckets)) and variant mapped kmers (buckets found = 1) and unique perfect (perfect and only mapped to 1 genome) in thread
 
         for (kmer, n) in chunk {
 
@@ -1154,24 +1153,46 @@ pub fn map_kmers(
                 }
             }
 
+            // Identify perfect + unique hits
+            let mut unique_flag: Option<u16> = None;
+            for (file_index, hits) in per_genome_bucket_hits.iter() {
+                if *hits == num_buckets_perfect {
+                    if unique_flag.is_none() {
+                        unique_flag = Some(*file_index);
+                    } else {
+                        // More than one perfect genome → not unique
+                        unique_flag = None;
+                        break;
+                    }
+                }
+            }
+
+            // Update counts
             for (file_index, hits) in per_genome_bucket_hits {
-                let entry = local_counts.entry(file_index).or_insert((0, 0));
+                let entry = local_counts.entry(file_index).or_insert((0, 0, 0));
                 if hits == num_buckets_perfect {
                     entry.0 += 1; // perfect match
                 } else if hits > 0 {
                     entry.1 += 1; // variant match
                 }
             }
+
+            // If this kmer mapped perfectly to exactly one genome, then update that entry to have one more perfect and unique kmer
+            if let Some(unique_genome) = unique_flag {
+                let entry = local_counts.entry(unique_genome).or_insert((0, 0, 0));
+                entry.2 += 1; // perfect + unique
+            }
         }
         // merge local counts into global DashMap
-        for (file_index, (perfect, variant)) in local_counts {
+        for (file_index, (perfect, variant, unique_perfect)) in local_counts {
             results
                 .entry(file_index)
                 .and_modify(|e| {
                     e.0 += perfect;
                     e.1 += variant;
+                    e.2 += unique_perfect;
                 })
-                .or_insert((perfect, variant));
+                .or_insert((perfect, variant, unique_perfect));
         }
     });
 
