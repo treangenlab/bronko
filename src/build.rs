@@ -92,7 +92,7 @@ fn check_args(args: &BuildArgs) {
     if args.threads <= 0 {
         error!("Number of threads must be greater than 0");
         std::process::exit(1);
-    } else if args.threads >= available_threads {
+    } else if args.threads > available_threads {
         error!("You requested {} threads but only have {} available on your system", args.threads, available_threads);
         std::process::exit(1);
     }
