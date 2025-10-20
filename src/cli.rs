@@ -113,11 +113,11 @@ pub struct CallArgs {
     #[clap(long="n-per-strand", default_value_t = DEFAULT_N_KMERS_PER_STRAND, help_heading="VARIANT CALLING PARAMETERS", help="Min number of unique kmers to observe to call a variant at any site (needed on both strands if strand filter active)")]
     pub n_per_strand: usize,
 
-    #[clap(long="min_strand_difference", default_value_t = DEFAULT_PERCENT_STRAND_DIFF, help_heading="VARIANT CALLING PARAMETERS", help="Minimum percent one strand's depth must be of the total depth in order to bypass strand filtering")]
-    pub min_strand_diff: f64,
+    #[clap(long="strand_odds", default_value_t = DEFAULT_MAX_STRAND_ODDS, help_heading="VARIANT CALLING PARAMETERS", help="Maximum strand odds ratio for a variant to pass strand filtering")]
+    pub strand_odds_max: f64,
 
     //min depth to call a variant
-    #[clap(long="min-depth", default_value_t = DEFAULT_MIN_DEPTH, help_heading="VARIANT CALLING PARAMETERS", help="Minimum depth at an allele to call a minor variant (default=50*min_kmers)")]
+    #[clap(long="min-depth", default_value_t = DEFAULT_MIN_DEPTH, help_heading="VARIANT CALLING PARAMETERS", help="Minimum total depth at an allele to call a minor variant (default=50*min_kmers)")]
     pub min_depth: usize,
 
     //OUTPUT PARAMETERS

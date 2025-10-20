@@ -720,7 +720,7 @@ pub fn print_output(
 
     // write out VCF format
     writeln!(writer, "##fileformat=VCFv4.5").unwrap();
-    writeln!(writer, "##source=bronkoV{}", BRONKO_VERSION).unwrap();
+    writeln!(writer, "##source=bronko-v{}", BRONKO_VERSION).unwrap();
     writeln!(writer, "##reference=file://{}", read_output).unwrap(); // update to reflect current genome
 
     let file_meta = &viral_metadata.files[*best_genome_index as usize];
@@ -733,11 +733,12 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Total Depth\">").unwrap();
     writeln!(writer, "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">").unwrap();
     writeln!(writer, "##INFO=<ID=DP4,Number=4,Type=Integer,Description=\"Fwd_ref,Rev_ref,Fwd_alt,Rev_alt\">").unwrap();
+    writeln!(writer, "##INFO=<ID=SOR,Number=4,Type=Float,Description=\"SOR\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
     for variant in variants{
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
-        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{}", seq_out, variant.pos, nucleotide_bits_to_char(variant.ref_base as u64), nucleotide_bits_to_char(variant.alt_base as u64), variant.depth, variant.af, variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt).unwrap()
+        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3}", seq_out, variant.pos, nucleotide_bits_to_char(variant.ref_base as u64), nucleotide_bits_to_char(variant.alt_base as u64), variant.depth, variant.af, variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt, variant.sor).unwrap()
     }
 }
 
@@ -752,7 +753,8 @@ pub struct VCFRecord{
     fwd_alt: u64,
     rev_alt: u64,
     depth: u64,
-    af: f64
+    af: f64,
+    sor: f64
 }
 
 
@@ -825,15 +827,6 @@ pub fn call_variants(
             let row_total: Vec<u64> = (0..4)
                 .map(|b| row[b] + row_rev[b])
                 .collect();
-            let fwd_depth: u64 = row.iter().sum();
-            let rev_depth: u64 = row_rev.iter().sum();
-            let percent_strand_depth: f64 = args.min_strand_diff;
-
-            let (min_depth_strand, max_depth_strand) = if fwd_depth < rev_depth {
-                (fwd_depth, rev_depth)
-            } else {
-                (rev_depth, fwd_depth)
-            };
 
             let total_depth = row_total.iter().sum();
             if total_depth == 0 {
@@ -850,6 +843,7 @@ pub fn call_variants(
                 }
 
                 // NEW Strand filter logic
+                let mut sor = args.strand_odds_max + 1.0;
                 if strand_filter {
                     let a = row[ref_base as usize] as f64 + 1.0; //ref fwd
                     let b = row_rev[ref_base as usize] as f64 + 1.0; //ref rev
@@ -861,46 +855,23 @@ pub fn call_variants(
                     let ref_ratio = (a.min(b)) / (a.max(b));
                     let alt_ratio = (c.min(d)) / (c.max(d));
                     
-                    let sor = (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln(); 
+                    sor = (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln(); 
 
-                    if pos == 4784 {
-                        info!("{}", sor)
-                    }
-                    if sor > 2.0 {
+                    // filter out if greater than strand odds ratio (default 2)
+                    if sor > args.strand_odds_max {
                         continue;
                     }
 
                     // additional filtering for low kmer support across both strands
                     let c_k = count[alt_base as usize] as usize;
-                    let d_k = count[alt_base as usize] as usize;
+                    let d_k = count_rev[alt_base as usize] as usize;
 
                     if c_k < n_kmer_per_strand && d_k < n_kmer_per_strand {
                         continue;
                     }
                 }
 
-                // OLD Strand filter logic
-                // 
-                // If the depths are uneven (one is <min_depth_percent% of the total_depth by default)
-                // then only one of the two strands must pass the n_kmer_per_strand (likely the dominant one)
-                // otherwise both must pass that filter. 
-                // 
-                // If there is no stand filter, then it does not matter, you just let everything pass with the same logic  
-                // 
-                // let pass_strand_filter = if strand_filter {
-                //     if min_depth_strand as f64 >= percent_strand_depth * max_depth_strand as f64 {
-                //         count[alt_base as usize] as usize >= n_kmer_per_strand && count_rev[alt_base as usize] as usize >= n_kmer_per_strand
-                //     } else {
-                //         count[alt_base as usize] as usize >= n_kmer_per_strand || count_rev[alt_base as usize] as usize >= n_kmer_per_strand
-                //     }
-                // } else {
-                //     true //might need to change this to follow the portion of above (aka any individual must have n_kmers, but both don't have to)
-                // };
-
-                // if !pass_strand_filter {
-                //     continue;
-                // }
-
+                //Get minor af (filter out if below reporting threshold)
                 let alt_count = row_total[alt_base as usize];
                 let af = alt_count as f64 / total_depth as f64;
                 
@@ -928,7 +899,8 @@ pub fn call_variants(
                     fwd_alt: row[alt_base as usize],
                     rev_alt: row_rev[alt_base as usize],
                     depth: total_depth,
-                    af: af
+                    af: af,
+                    sor: sor
                 })
 
             }
@@ -947,7 +919,6 @@ pub fn call_variants(
 pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Result<(usize, usize, usize, usize), String> {
     let fastq_path = reads.clone();
     let file_stem = clean_sample_id(&fastq_path);
-    info!("FILE STEM: {}", file_stem);
 
     let output_dir = Path::new(&args.output);
     let tmp_dir = output_dir.join(format!("tmp_{}", file_stem));
