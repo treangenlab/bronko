@@ -130,10 +130,7 @@ pub fn call(args: CallArgs) {
         std::process::exit(1);
     });
 
-    fs::create_dir_all(out_path.join("tmp")).unwrap_or_else(|e| {
-        error!("{} | Unable to create outputs in output directory", e);
-        std::process::exit(1);
-    });
+
 
     let (ref_index, viral_metadata);
 
@@ -368,7 +365,6 @@ pub fn call(args: CallArgs) {
         build_alignments_for_genomes(&output_info, &variant_info, &viral_metadata, &args);
     }
 
-    fs::remove_dir_all(format!("{}/tmp", args.output)).ok();
     info!("");
     info!("bronko complete!");
 
@@ -724,7 +720,7 @@ pub fn print_output(
 
     // write out VCF format
     writeln!(writer, "##fileformat=VCFv4.5").unwrap();
-    writeln!(writer, "##source=bronkoV{}", BRONKO_VERSION).unwrap();
+    writeln!(writer, "##source=bronko-v{}", BRONKO_VERSION).unwrap();
     writeln!(writer, "##reference=file://{}", read_output).unwrap(); // update to reflect current genome
 
     let file_meta = &viral_metadata.files[*best_genome_index as usize];
@@ -737,11 +733,12 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Total Depth\">").unwrap();
     writeln!(writer, "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">").unwrap();
     writeln!(writer, "##INFO=<ID=DP4,Number=4,Type=Integer,Description=\"Fwd_ref,Rev_ref,Fwd_alt,Rev_alt\">").unwrap();
+    writeln!(writer, "##INFO=<ID=SOR,Number=4,Type=Float,Description=\"SOR\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
     for variant in variants{
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
-        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{}", seq_out, variant.pos, nucleotide_bits_to_char(variant.ref_base as u64), nucleotide_bits_to_char(variant.alt_base as u64), variant.depth, variant.af, variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt).unwrap()
+        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3}", seq_out, variant.pos, nucleotide_bits_to_char(variant.ref_base as u64), nucleotide_bits_to_char(variant.alt_base as u64), variant.depth, variant.af, variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt, variant.sor).unwrap()
     }
 }
 
@@ -756,7 +753,8 @@ pub struct VCFRecord{
     fwd_alt: u64,
     rev_alt: u64,
     depth: u64,
-    af: f64
+    af: f64,
+    sor: f64
 }
 
 
@@ -829,15 +827,6 @@ pub fn call_variants(
             let row_total: Vec<u64> = (0..4)
                 .map(|b| row[b] + row_rev[b])
                 .collect();
-            let fwd_depth: u64 = row.iter().sum();
-            let rev_depth: u64 = row_rev.iter().sum();
-            let percent_strand_depth: f64 = args.min_strand_diff;
-
-            let (min_depth_strand, max_depth_strand) = if fwd_depth < rev_depth {
-                (fwd_depth, rev_depth)
-            } else {
-                (rev_depth, fwd_depth)
-            };
 
             let total_depth = row_total.iter().sum();
             if total_depth == 0 {
@@ -853,28 +842,36 @@ pub fn call_variants(
                     continue;
                 }
 
-                // Strand filter logic
-                // 
-                // If the depths are uneven (one is <min_depth_percent% of the total_depth by default)
-                // then only one of the two strands must pass the n_kmer_per_strand (likely the dominant one)
-                // otherwise both must pass that filter. 
-                // 
-                // If there is no stand filter, then it does not matter, you just let everything pass with the same logic  
-                // 
-                let pass_strand_filter = if strand_filter {
-                    if min_depth_strand as f64 >= percent_strand_depth * max_depth_strand as f64 {
-                        count[alt_base as usize] as usize >= n_kmer_per_strand && count_rev[alt_base as usize] as usize >= n_kmer_per_strand
-                    } else {
-                        count[alt_base as usize] as usize >= n_kmer_per_strand || count_rev[alt_base as usize] as usize >= n_kmer_per_strand
-                    }
-                } else {
-                    true //might need to change this to follow the portion of above (aka any individual must have n_kmers, but both don't have to)
-                };
+                // NEW Strand filter logic
+                let mut sor = args.strand_odds_max + 1.0;
+                if strand_filter {
+                    let a = row[ref_base as usize] as f64 + 1.0; //ref fwd
+                    let b = row_rev[ref_base as usize] as f64 + 1.0; //ref rev
+                    let c = row[alt_base as usize] as f64 + 1.0; //alt fwd
+                    let d = row_rev[alt_base as usize] as f64 + 1.0; //alt rev
 
-                if !pass_strand_filter {
-                    continue;
+                    //Using GATK strand odds ratio
+                    let r = (a*d)/(b*c);
+                    let ref_ratio = (a.min(b)) / (a.max(b));
+                    let alt_ratio = (c.min(d)) / (c.max(d));
+                    
+                    sor = (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln(); 
+
+                    // filter out if greater than strand odds ratio (default 2)
+                    if sor > args.strand_odds_max {
+                        continue;
+                    }
+
+                    // additional filtering for low kmer support across both strands
+                    let c_k = count[alt_base as usize] as usize;
+                    let d_k = count_rev[alt_base as usize] as usize;
+
+                    if c_k < n_kmer_per_strand && d_k < n_kmer_per_strand {
+                        continue;
+                    }
                 }
 
+                //Get minor af (filter out if below reporting threshold)
                 let alt_count = row_total[alt_base as usize];
                 let af = alt_count as f64 / total_depth as f64;
                 
@@ -902,7 +899,8 @@ pub fn call_variants(
                     fwd_alt: row[alt_base as usize],
                     rev_alt: row_rev[alt_base as usize],
                     depth: total_depth,
-                    af: af
+                    af: af,
+                    sor: sor
                 })
 
             }
@@ -922,9 +920,8 @@ pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Resu
     let fastq_path = reads.clone();
     let file_stem = clean_sample_id(&fastq_path);
 
-
     let output_dir = Path::new(&args.output);
-    let tmp_dir = output_dir.join("tmp");
+    let tmp_dir = output_dir.join(format!("tmp_{}", file_stem));
     fs::create_dir_all(&tmp_dir)
         .map_err(|e| format!("Failed to create tmp dir: {}", e))?;
 
@@ -932,7 +929,7 @@ pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Resu
     fs::create_dir_all(output_dir)
         .map_err(|e| format!("Failed to create output dir: {}", e))?;
 
-    let res_prefix: String= format!("{}/{}.res", args.output, file_stem);
+    let res_prefix = format!("{}/{}.res", args.output, file_stem);
     let kmc_output = Command::new("kmc")
         .args(&[
             &format!("-k{}", args.kmer),
@@ -943,7 +940,7 @@ pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Resu
             "-cs1000000",
             &format!("{}", fastq_path),
             &res_prefix,
-            &format!("{}", Path::new(&args.output).join("tmp").to_string_lossy()),
+            tmp_dir.to_str().unwrap(),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -979,6 +976,10 @@ pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Resu
         ])
         .output()
         .map_err(|e| format!("KMC3 tools failed | {}", e))?;
+
+    if let Err(e) = fs::remove_dir_all(&tmp_dir) {
+        warn!("Failed to remove tmp dir {}: {}", tmp_dir.display(), e);
+    }
 
     if !kmc_dump_output.status.success(){
         return Err(format!("KMC3 dump failed | {}", String::from_utf8_lossy(&kmc_dump_output.stderr)))
@@ -1073,7 +1074,7 @@ pub fn map_kmers(
                 if let Some(bucket_infos) = index.get(&bucket) {
 
                     for info in bucket_infos {
-                        // NEED TO UPDATE TO FILTER OUT DUPLICATE BUCKETS IN GENOMES
+                        // NEED TO UPDATE TO FILTER OUT DUPLICATE BUCKETS IN GENOMES (Problem is that buckets could be from multiple)
 
                         //get sequence info from metadata
                         let file_meta = &viral_metadata.files[info.file_id as usize];
