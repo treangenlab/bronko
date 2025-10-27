@@ -771,7 +771,7 @@ pub struct Noise{
 pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
 
     //window size and alppa, max table size for our streaming version of thompson tau
-    let window_size = 200;
+    let window_size = 100;
     let alpha = 0.001;
     let max_table_len = window_size / 10;
 
@@ -793,28 +793,33 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
     let mut mu:f64; //rolling mean
     let mut var:f64; //rolling variance
 
+    let half_window = window_size / 2;
 
-    for i in 0..len {
+    for i in 0..(len + half_window) {
 
-        let base_pos = i % window_size * 3;
-
-        // Combine counts across strands
-        let mut counts: Vec<u64> = (0..4)
-            .map(|b| fwd.counts[i][b] + rev.counts[i][b])
-            .collect();
-        counts.sort_unstable_by(|a, b| b.cmp(a));
-        let total_depth: u64 = counts.iter().sum();
-        let freqs: Vec<f64> = counts.iter().map(|&c| c as f64 / total_depth as f64).collect();
-
-        // if no depth, skip
-        if counts[0] == 0 {
-            continue;
-        }
+        let base_pos = (i % window_size) * 3;
+        
+        
+        let freqs: Vec<f64> = if i < len {
+            // Combine counts across strands
+            let mut counts: Vec<u64> = (0..4)
+                .map(|b| fwd.counts[i][b] + rev.counts[i][b])
+                .collect();
+            counts.sort_unstable_by(|a, b| b.cmp(a));
+            let total_depth: u64 = counts.iter().sum();
+            if total_depth == 0 {
+                vec![0.0; 4]
+            } else {
+                counts.iter().map(|&c| c as f64 / total_depth as f64).collect()
+            }
+        } else {
+            vec![0.0; 4]
+        };
 
         //loop through minor variants for that position and update n, s, s2
-        for j in 1..3 {
+        for j in 1..4 {
 
-            let idx = base_pos + j - 1;
+            let idx = base_pos + (j - 1);
 
             //remove the old values
             let old = window_counts[idx];
@@ -882,14 +887,14 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
         let mut curr_var = var;
 
         while curr_max_idx < max_table_len && maxes[curr_max_idx] != 0.0 {
-            //calculate t from thompson tau test FILL IN HERE
+            //calculate t from thompson tau test
             let candidate_outlier = maxes[curr_max_idx];
             let std = curr_var.sqrt();
 
             let tau = if curr_n > 2 {
                 let df = (curr_n - 2) as f64;
                 let t_crit = StudentsT::new(0.0, 1.0, df).unwrap()
-                    .inverse_cdf(1.0 - alpha / (2.0 * curr_n as f64));
+                    .inverse_cdf(1.0 - alpha / (curr_n as f64));
                 (t_crit * (curr_n as f64 - 1.0)) / ((curr_n as f64).sqrt() * ((curr_n as f64 - 2.0 + t_crit * t_crit).sqrt()))
             } else {
                 f64::INFINITY
@@ -898,7 +903,6 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             // see if current max - mu is greater than t - sqrt(var)
             // if so, adjust temp n, s, s2, then recalculate mu and var and go to next max. 
             // if not, set the baseline noise at i to curr_mu, curr_var, curr_max
-            //FILL IN HERE
             if (candidate_outlier as f64 - curr_mu).abs() > tau * std {
                 curr_s -= candidate_outlier;
                 curr_s2 -= candidate_outlier;
@@ -917,11 +921,17 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
 
         }
 
-        baseline_noise[i] = Noise{
-            max: maxes[curr_max_idx],
-            mean: curr_mu,
-            std: curr_var.sqrt()
-        };
+        // update the noise levels
+        if i >= half_window {
+            let write_idx = i - half_window;
+            if write_idx < len {
+                baseline_noise[write_idx] = Noise{
+                    max: maxes[curr_max_idx],
+                    mean: curr_mu,
+                    std: curr_var.sqrt()
+                };
+            }
+        }
     }
 
     baseline_noise
@@ -962,6 +972,10 @@ pub fn call_variants(
         let rev_counts = output_rev_count.get(seq).expect("Missing rev counts");
 
         let baseline_noise: Vec<Noise> = get_baseline_noise(&*fwd, &*rev);
+
+        // for i in 100..120 {
+        //     info!("{}", baseline_noise[i].mean);
+        // }
 
         let len = fwd.counts.len();
         let mut start = 0;
@@ -1045,9 +1059,10 @@ pub fn call_variants(
                 let alt_count = row_total[alt_base as usize];
                 let af = alt_count as f64 / total_depth as f64;
                 
-                if af < min_af {
+                if af < min_af || af < (2.0*baseline_noise[i].max) {
                     continue;
                 }
+
 
                 // call major/minor variants
                 if af >= 0.5 {
