@@ -23,6 +23,9 @@ use std::path::{Path};
 use std::io::{BufReader, BufRead, BufWriter, Write};
 use std::process::{Command, Stdio};
 
+use statrs::distribution::{StudentsT, ContinuousCDF};
+
+
 
 fn check_args(args: &CallArgs) {
     let output_level;
@@ -757,7 +760,173 @@ pub struct VCFRecord{
     sor: f64
 }
 
+#[derive(Debug, Clone)]
+pub struct Noise{
+    max: f64,
+    mean: f64,
+    std: f64,
+}
 
+
+pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
+
+    //window size and alppa, max table size for our streaming version of thompson tau
+    let window_size = 200;
+    let alpha = 0.001;
+    let max_table_len = window_size / 10;
+
+    let len = fwd.counts.len();
+    
+    // The output of what we want
+    let mut baseline_noise = vec![Noise {max: 0.0, mean: 0.0, std: 0.0}; len];
+
+    //storing the counts in the window (since max 3 alternative nucleotides the length is 3 * window length, which we can index based off of genome_pos % window_size)
+    //we also keep in_max which is 0 or 1 depending on if it is in the max table
+    let mut window_counts = vec![0.0; len*3];
+    let mut in_max = vec![0; len*3];
+
+    let mut maxes = vec![0.0; max_table_len];
+
+    let mut n:usize = 0; //number of variant positions in the window (between 0-3*len)
+    let mut s:f64 = 0.0; //sum of the variant positions
+    let mut s2:f64 = 0.0; //sum^2 of variant positions
+    let mut mu:f64; //rolling mean
+    let mut var:f64; //rolling variance
+
+
+    for i in 0..len {
+
+        let base_pos = i % window_size * 3;
+
+        // Combine counts across strands
+        let mut counts: Vec<u64> = (0..4)
+            .map(|b| fwd.counts[i][b] + rev.counts[i][b])
+            .collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let total_depth: u64 = counts.iter().sum();
+        let freqs: Vec<f64> = counts.iter().map(|&c| c as f64 / total_depth as f64).collect();
+
+        // if no depth, skip
+        if counts[0] == 0 {
+            continue;
+        }
+
+        //loop through minor variants for that position and update n, s, s2
+        for j in 1..3 {
+
+            let idx = base_pos + j - 1;
+
+            //remove the old values
+            let old = window_counts[idx];
+            if old > 0.0 {
+                n -= 1;
+                s -= old;
+                s2 -= old * old;
+
+                //remove from max if there
+                if in_max[idx] == 1 {
+                    //remove from maxes table and shift others up
+                    if let Some(pos) = maxes.iter().position(|&x| (x - old).abs() < 1e-12) {
+                        for k in pos..(max_table_len - 1) {
+                            maxes[k] = maxes[k+1];
+                        }
+                        maxes[max_table_len - 1] = 0.0;
+                    }
+                    in_max[idx] = 0;
+                }
+            }
+
+            //update with new values
+            let maf = freqs[j];
+            if maf > 0.0 {
+                n += 1;
+                s += maf;
+                s2 += maf * maf;
+
+                //loop through max table from bottom and update
+                for k in (0..max_table_len).rev() {
+                    if maf > maxes[k] {
+                        if k + 1 < max_table_len {
+                            maxes[k + 1] = maxes[k];
+                        }
+                        maxes[k] = maf;
+                    } else {
+                        break;
+                    }
+                }
+                in_max[idx] = 1;
+            } else {
+                in_max[idx] = 0;
+                window_counts[idx] = 0.0;
+            }
+
+            window_counts[idx] = maf;
+
+        }
+
+        //update mu and var
+        if n != 0 {
+            mu = s / n as f64;
+            var = (s2 / n as f64) - mu * mu;
+        } else {
+            mu = 0.0;
+            var = 0.0;
+        }
+
+        //perform thompson tau for that window starting from largest in max:
+        let mut curr_max_idx:usize = 0;
+        let mut curr_n = n;
+        let mut curr_s = s;
+        let mut curr_s2 = s2;
+        let mut curr_mu = mu;
+        let mut curr_var = var;
+
+        while curr_max_idx < max_table_len && maxes[curr_max_idx] != 0.0 {
+            //calculate t from thompson tau test FILL IN HERE
+            let candidate_outlier = maxes[curr_max_idx];
+            let std = curr_var.sqrt();
+
+            let tau = if curr_n > 2 {
+                let df = (curr_n - 2) as f64;
+                let t_crit = StudentsT::new(0.0, 1.0, df).unwrap()
+                    .inverse_cdf(1.0 - alpha / (2.0 * curr_n as f64));
+                (t_crit * (curr_n as f64 - 1.0)) / ((curr_n as f64).sqrt() * ((curr_n as f64 - 2.0 + t_crit * t_crit).sqrt()))
+            } else {
+                f64::INFINITY
+            };
+
+            // see if current max - mu is greater than t - sqrt(var)
+            // if so, adjust temp n, s, s2, then recalculate mu and var and go to next max. 
+            // if not, set the baseline noise at i to curr_mu, curr_var, curr_max
+            //FILL IN HERE
+            if (candidate_outlier as f64 - curr_mu).abs() > tau * std {
+                curr_s -= candidate_outlier;
+                curr_s2 -= candidate_outlier;
+                curr_n -= 1;
+                if curr_n > 0 {
+                    curr_mu = curr_s as f64 / curr_n as f64;
+                    curr_var = (curr_s2 as f64 / curr_n as f64) - curr_mu * curr_mu;
+                } else {
+                    curr_mu = 0.0;
+                    curr_var = 0.0;
+                }
+                curr_max_idx += 1;
+            } else {
+                break;
+            }
+
+        }
+
+        baseline_noise[i] = Noise{
+            max: maxes[curr_max_idx],
+            mean: curr_mu,
+            std: curr_var.sqrt()
+        };
+    }
+
+    baseline_noise
+
+}
 
 pub fn call_variants(
     args: &CallArgs, 
@@ -792,10 +961,11 @@ pub fn call_variants(
         let fwd_counts = output_count.get(seq).expect("Missing fwd counts");
         let rev_counts = output_rev_count.get(seq).expect("Missing rev counts");
 
+        let baseline_noise: Vec<Noise> = get_baseline_noise(&*fwd, &*rev);
+
         let len = fwd.counts.len();
         let mut start = 0;
         let mut end = len;
-        
 
         // change the start and end depending if we are filtering the ends of sequences by k
         if filter_end_seq {
