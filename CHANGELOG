@@ -2,8 +2,10 @@
 
 All major changes to bronko will be documented in this file
 
-## [v0.0.2] - 10/20/2025
+## [v0.0.3] - 10/28/2025
+- Introduced baseline noise filter using streaming version of modified thompson tau filter
 
+## [v0.0.2] - 10/20/2025
 - Fixed major bug when counting kmers for paired end reads 
 - Introduced SOR strand filter replacement for previous naive method 
 
