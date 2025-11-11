@@ -100,6 +100,30 @@ fn check_args(args: &CallArgs) {
         warn!("Number of kmers per strand set very high, only strongly supported variants will be returned")
     }
 
+
+    if args.strand_balance_ratio < 0.0 {
+        error!("Strand balance ratio is set to below 0, must be between 0.0 and 1.0");
+        std::process::exit(1);
+    } else if args.strand_balance_ratio > 1.0 {
+        error!("Strand balance ratio is set above 1, must be between 0.0 and 1.0");
+        std::process::exit(1);
+    } else if args.strand_balance_ratio == 1.0 {
+        warn!("Strand balance ratio is set to 1, all variants will pass this filter");
+    }
+
+    if args.min_variant_depth < 0 {
+        warn!("Minimum variant depth set below 0, all variants will be returned");
+    }
+
+    if args.variant_multiplier < 1.0 {
+        error!("Noise multiplier for variant detection is set to below 1.0, must be greater than 1.0 (recommended between 1.3-2.0)");
+        std::process::exit(1);
+    } else if args.variant_multiplier > 2.0 {
+        warn!("Strand balance ratio is set above 2, may experience a drop in recall (we recommend ~1.5)");
+    } else if args.variant_multiplier == 1.0 {
+        warn!("Noise multiplier for variant detection set to 1.0, all variants will pass this filter");
+    }
+
     if args.first_pairs.len() != args.second_pairs.len() {
         error!("Number of paired end sequences do not match, exiting.");
         std::process::exit(1);
@@ -1027,31 +1051,43 @@ pub fn call_variants(
                 }
 
                 // NEW Strand filter logic
-                let mut sor = args.strand_odds_max + 1.0;
+                let mut sor = args.strand_odds_max + 1.0; //default is above the given so filtered if not able to calculate
                 if strand_filter {
                     let a = row[ref_base as usize] as f64 + 1.0; //ref fwd
                     let b = row_rev[ref_base as usize] as f64 + 1.0; //ref rev
                     let c = row[alt_base as usize] as f64 + 1.0; //alt fwd
                     let d = row_rev[alt_base as usize] as f64 + 1.0; //alt rev
 
-                    //Using GATK strand odds ratio
-                    let r = (a*d)/(b*c);
-                    let ref_ratio = (a.min(b)) / (a.max(b));
-                    let alt_ratio = (c.min(d)) / (c.max(d));
-                    
-                    sor = (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln(); 
+                    //calculate the difference between the strands
+                    let ref_total = a + b + c + d;
+                    let min_strand_depth = (a+c).min(b+d);
+                    let min_strand_percent = min_strand_depth / ref_total;
 
-                    // filter out if greater than strand odds ratio (default 2)
-                    if sor > args.strand_odds_max {
-                        continue;
-                    }
+                    //if the strand balance filter is on (default), then always do SOR filter
+                    //if the strand balance filter is off, then only do SOR filter when 1 strand is > strand_balance_ratio of total depth (by default 10% of total depth, aka all cases where 1 strand is less than 10% of the total depth are ignored)
+                    if (!args.no_strand_balance_filter) | ((args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) { 
+                        
+                        //Using GATK strand odds ratio
+                        let r = (a*d)/(b*c);
+                        let ref_ratio = (a.min(b)) / (a.max(b));
+                        let alt_ratio = (c.min(d)) / (c.max(d));
+                        
+                        sor = (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln(); 
 
-                    // additional filtering for low kmer support across both strands
-                    let c_k = count[alt_base as usize] as usize;
-                    let d_k = count_rev[alt_base as usize] as usize;
+                        // filter out if greater than strand odds ratio (default 8)
+                        if sor > args.strand_odds_max {
+                            continue;
+                        }
 
-                    if c_k < n_kmer_per_strand && d_k < n_kmer_per_strand {
-                        continue;
+                        // additional filtering for low kmer support across both strands
+                        let c_k = count[alt_base as usize] as usize;
+                        let d_k = count_rev[alt_base as usize] as usize;
+
+                        if c_k < n_kmer_per_strand && d_k < n_kmer_per_strand {
+                            continue;
+                        }
+                    } else {
+                        sor = -1.0; //output SOR == -1.0 if the strand is unbalanced so not tested
                     }
                 }
 
@@ -1059,7 +1095,12 @@ pub fn call_variants(
                 let alt_count = row_total[alt_base as usize];
                 let af = alt_count as f64 / total_depth as f64;
                 
-                if af < min_af || af < (2.0*baseline_noise[i].max) {
+                let y0: f64 = args.variant_multiplier;
+                let p0: f64 = 0.5;
+                let a: f64 = 0.03;
+                let factor = y0 + p0 * a.powf(100.0 * af);
+
+                if af < min_af || af < (factor.max(y0) * baseline_noise[i].max) {
                     continue;
                 }
 
@@ -1070,7 +1111,10 @@ pub fn call_variants(
                 } else {
                     if total_depth < args.min_depth as u64 { // filter out minor variants when the total depth is too low
                         continue;
-                    } 
+                    }
+                    if alt_count < args.min_variant_depth as u64 { //filter out minor variants when variant depth is below threshold
+                        continue;
+                    }
                     num_minor_variants += 1;
                 }
 
