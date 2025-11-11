@@ -9,7 +9,7 @@ bronko also allows users to run multiple samples of the same species and build a
 
 ### Why use bronko over existing viral variant callers?
 1. **Simplicity** -- bronko bypasses most steps of typical variant calling (indexing, read mapping, sam manipulation, variant calling, alignment, etc) and packages everything into 1-2 commands
-2. **Large Scale Capability** -- bronko allows you to test hundreds of strains against hundreds of smaples simultaneously, allowing you to variant call diverse samples with diverse reference genomes
+2. **Large Scale Capability** -- bronko allows you to test hundreds of strains against hundreds of samples simultaneously, allowing you to variant call diverse samples with diverse reference genomes
 3. **Consistently ultrafast** -- bronko is between 10-1000x faster than existing pipelines for read mapping (bowtie2, ie) and then variant calling (lofreq, ivar, ie), depending on the sequencing depth / number of reads as well as the number of threads available
 4. **Comparable precision and sensitivity** -- On our benchmarks so far, bronko achieves reasonable consistency with both ivar and lofreq on variant calling for both SNPs and iSNVs, even outperforming in some cases.
 
