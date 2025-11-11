@@ -112,7 +112,11 @@ fn check_args(args: &CallArgs) {
     }
 
     if args.min_variant_depth < 0 {
-        warn!("Minimum variant depth set below 0, all variants will be returned");
+        warn!("Minimum variant depth set below 0, all variants will be returned if passing other thresholds");
+    }
+
+    if args.min_depth < 0 {
+        warn!("Minimum total depth for minor variant calling set below 0, all variants will be returned if passing other thresholds");
     }
 
     if args.variant_multiplier < 1.0 {
