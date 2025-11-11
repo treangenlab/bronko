@@ -3,27 +3,29 @@
 # bronko - ultra-rapid mapping free viral variant calling
 
 ## Introduction
-**bronko** is a viral variant caller that can rapidly detect most major and minor variants in any given sequencing dataset. bronko bypasses read mapping and variant calling and directly outputs a VCF from reads and a reference genome.  
+**bronko** is a viral variant caller that can rapidly detect most major and minor variants in any given sequencing dataset. bronko bypasses read mapping and variant calling and directly outputs a VCF from a set of reads and reference genome(s).  
 
 bronko also allows users to run multiple samples of the same species and build an alignment that can be inputted directly into phylogenetics software
 
 ### Why use bronko over existing viral variant callers?
 1. **Simplicity** -- bronko bypasses most steps of typical variant calling (indexing, read mapping, sam manipulation, variant calling, alignment, etc) and packages everything into 1-2 commands
-2. **Consistently ultrafast** -- bronko is between 10-1000x faster than existing pipelines for read mapping (bowtie2, ie) and then variant calling (lofreq, ivar, ie), depending on the sequencing depth / number of reads as well as the number of threads available
-3. **Comparable accuracy and sensitivity** -- On our benchmarks so far, bronko achieves reasonable consistency with both ivar and lofreq on variant calling for SNVs, even sometimes outperforming on recall in some cases
+2. **Large Scale Capability** -- bronko allows you to test hundreds of strains against hundreds of smaples simultaneously, allowing you to variant call diverse samples with diverse reference genomes
+3. **Consistently ultrafast** -- bronko is between 10-1000x faster than existing pipelines for read mapping (bowtie2, ie) and then variant calling (lofreq, ivar, ie), depending on the sequencing depth / number of reads as well as the number of threads available
+4. **Comparable precision and sensitivity** -- On our benchmarks so far, bronko achieves reasonable consistency with both ivar and lofreq on variant calling for both SNPs and iSNVs, even outperforming in some cases.
 
 ### Why not to use bronko
-1. If you are interested in identifying novel indels in viral genomes, currently we do not report on indel presence, but we are working on this problem. For historical sequencing data, we attempt to bypass this problem by letting you use multiple reference genomes and then selecting the one with highest identity to each sample.
-2. If you are interested in super (<0.5% MAF) frequency mutations. Generally we have found that performance degrades below that threshold, but we are working on addressing this. 
+1. If you are interested in identifying novel indels in viral genomes, currently we do not report on indel presence, but we are working on this problem. For historical sequencing data, we attempt to bypass this problem by letting you incorporate multiple reference genomes into a database and then we will automatically select the one with highest identity to each sample.
 
 ### How does bronko work
 byonko bypasses readmapping by directly mapping kmers with small edit distance to a pileup representing the forward and reverse strands. It then uses the depth information and number of kmers mapping to each position/base to perform variant calling, similarly to existing tools. The lack of a formal pileup makes the process much more efficient, and thus we are able to achieve similar results in a fraction of the time.  
 
 ## Some notes before running
-Please perform quality control on your samples before running through this tool. In particular, please remove any primer sequences that were used. It is also helpful to have reasonable base quality thresholds (>25 or >30) as bronko is unable to take this into account due to the transformation into kmer space. 
+Please perform quality control on your samples before running through this tool. In particular, please remove any primer sequences that were used, as this can have a large downstream impact on variant calls (for any software, but particularly using a kmer-based approach). It is also helpful to have reasonable base quality thresholds (>25 or >30) as bronko is unable to take this into account due to the transformation into kmer space. 
+
+For iSNVs, it is your responsibility to interpret the calls. Calling of iSNVs is known to be subject to a number of biases in the library preperation, PCR, and sequencing processes. We cannot control the input into bronko, and while we have found bronko to be very precise in its calls, it is intended to be used as a tool to identify putative iSNVs rather than declaring biological relevance.  
 
 ## Requirements
-The only non-rust requirement is KMC3 (https://github.com/refresh-bio/KMC), so please follow the instructions on their github to download the software on your system (either through conda or by downloading the source code directly). If you are downloading from conda (recommended), you do not need to worry about this. 
+The only non-rust requirement is KMC3 (https://github.com/refresh-bio/KMC), so please follow the instructions on their github to download the software on your system (either through conda or by downloading the source code directly). If you are downloading bronko using conda (recommended), you do not need to worry about this. 
 
 ## Installation Instructions
 
