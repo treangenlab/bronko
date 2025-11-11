@@ -1,6 +1,6 @@
 [package]
 name = "bronko"
-version = "0.0.3"
+version = "0.1.0"
 edition = "2021"
 authors = [
     "Ryan Doughty <rdd4@rice.edu>",

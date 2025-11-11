@@ -93,7 +93,7 @@ pub struct CallArgs {
     pub use_full_kmer: bool,
 
     //number of buckets to ignore on ends of kmers 
-    #[clap(long="n-fixed", default_value_t = DEFAULT_N_FIXED, help_heading="ALGORITHM", help="Number of fixed positions at the end of each kmer")]
+    #[clap(long="n-fixed", default_value_t = DEFAULT_N_FIXED, help_heading="ALGORITHM", help="Number of fixed positions at the end of each kmer that cannot contribute to pileup")]
     pub n_fixed: usize,
 
     //VARIANT CALLING PARAMETERS
@@ -106,8 +106,16 @@ pub struct CallArgs {
     pub no_end_filter: bool,
 
     //do not do strand filtering 
-    #[clap(long="no-strand-filter", default_value_t = DEFAULT_NO_STRAND_FILTER, help_heading="VARIANT CALLING PARAMETERS", help="Do not filter variants that are present on one strand but not the other")]
+    #[clap(long="no-strand-filter", default_value_t = DEFAULT_NO_STRAND_FILTER, help_heading="VARIANT CALLING PARAMETERS", help="Do not utilize SOR test to filter variants that are present on one strand but not the other")]
     pub no_strand_filter: bool,
+
+    //do not filter variants with extreme strand balance issues
+    #[clap(long="no-strand-balance-filter", default_value_t = DEFAULT_NO_STRAND_BALANCE_FILTER, help_heading="VARIANT CALLING PARAMETERS", help="Allow variants with extreme strand disbalance pass without SOR check (will not matter if --no-strand-filter present)")]
+    pub no_strand_balance_filter: bool,
+
+    //strand balance ratio for strand to be ignored
+    #[clap(long="balance-ratio", default_value_t = DEFAULT_STRAND_BALANCE_RATIO, help_heading="VARIANT CALLING PARAMETERS", help="Percent of total depth that one strand must be under to be considered unbalanced (must be [0.0-1.0])")]
+    pub strand_balance_ratio: f64,
 
     //the number of kmers per strand that are required to call a variant
     #[clap(long="n-per-strand", default_value_t = DEFAULT_N_KMERS_PER_STRAND, help_heading="VARIANT CALLING PARAMETERS", help="Min number of unique kmers to observe to call a variant at any site (needed on both strands if strand filter active)")]
@@ -117,8 +125,16 @@ pub struct CallArgs {
     pub strand_odds_max: f64,
 
     //min depth to call a variant
-    #[clap(long="min-depth", default_value_t = DEFAULT_MIN_DEPTH, help_heading="VARIANT CALLING PARAMETERS", help="Minimum total depth at an allele to call a minor variant (default=50*min_kmers)")]
+    #[clap(long="min-depth", default_value_t = DEFAULT_MIN_DEPTH, help_heading="VARIANT CALLING PARAMETERS", help="Minimum total depth at an allele to call a minor variant (default=100*min_kmers)")]
     pub min_depth: usize,
+
+    //minimum reads/kmers supporting a minor variant
+    #[clap(long="min-variant-depth", default_value_t = MIN_KMER_COUNT, help_heading = "VARIANT CALLING PARAMETERS", help="Minimum depth of a minor variant to be called present (default=min_kmers)")]
+    pub min_variant_depth: usize,
+
+    //noise multiplier
+    #[clap(long="noise-multiplier", default_value_t = DEFAULT_NOISE_MULTIPLIER, help_heading = "VARIANT CALLING PARAMETERS", help="How much greater (1x, 1.5x, etc) the minor allele frequency of a variant must be above estimated baseline noise in that region (must be > 1.0x). Note that for variants under 1%, multiplier will be increased exponentially up to +0.5 more")]
+    pub variant_multiplier: f64,
 
     //OUTPUT PARAMETERS
     //todo add output locations, output formats

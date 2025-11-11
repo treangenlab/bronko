@@ -2,6 +2,11 @@
 
 All major changes to bronko will be documented in this file
 
+## [v0.1.0] - 11/11/2025
+- First major release of bronko, corresponding to first manuscript
+- Updated defaults for multiple variant calling parameters, introduced multiple others to allow more control over variant calls
+- By default now significant strand balance issues will be filtered
+
 ## [v0.0.3] - 10/28/2025
 - Introduced baseline noise filter using streaming version of modified thompson tau filter
 
