@@ -141,6 +141,23 @@ pub struct CallArgs {
     #[clap(long="noise-multiplier", default_value_t = DEFAULT_NOISE_MULTIPLIER, help_heading = "VARIANT CALLING PARAMETERS", help="How much greater (1x, 1.5x, etc) the minor allele frequency of a variant must be above estimated baseline noise in that region (must be > 1.0x). Note that for variants under 1%, multiplier will be increased exponentially up to +0.5 more")]
     pub variant_multiplier: f64,
 
+    //INDEL PARAMETERS
+    //window size for streaming breakpoint detection
+    #[clap(long="indel-window", default_value_t = DEFAULT_INDEL_WINDOW, help_heading="INDEL DETECTION", help="Window size (number of neighboring log-depth changes) used when z-scoring indel breakpoints")]
+    pub indel_window: usize,
+
+    //min |z-score| to flag a breakpoint
+    #[clap(long="indel-zscore", default_value_t = DEFAULT_INDEL_ZSCORE, help_heading="INDEL DETECTION", help="Minimum absolute z-score of the center log-depth change to flag a potential indel breakpoint")]
+    pub indel_zscore: f64,
+
+    //min total depth at a position to consider a breakpoint
+    #[clap(long="indel-min-depth", default_value_t = DEFAULT_INDEL_MIN_DEPTH, help_heading="INDEL DETECTION", help="Minimum total depth at a position for it to be considered as an indel breakpoint")]
+    pub indel_min_depth: usize,
+
+    //max total depth of a flanking position for a breakpoint (enforces a coverage cliff)
+    #[clap(long="indel-neighbor-max-depth", default_value_t = DEFAULT_INDEL_NEIGHBOR_MAX_DEPTH, help_heading="INDEL DETECTION", help="At least one position flanking the breakpoint must have total depth below this value (enforces an actual coverage cliff)")]
+    pub indel_neighbor_max_depth: usize,
+
     //OUTPUT PARAMETERS
     //todo add output locations, output formats
     #[clap(short, long="output", help_heading="OUTPUT", default_value = DEFAULT_OUT_FOLDER, help="Folder to output all resulting files")]

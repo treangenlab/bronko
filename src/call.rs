@@ -349,7 +349,9 @@ pub fn call(args: CallArgs) {
             info!("Initializing mapping arrays");
             let output_maps = initialize_output_maps(&viral_metadata);
             info!("Mapping kmers to all genomes");
-            let mapping_data = map_kmers(&kmers, &ref_index, &viral_metadata, &args.threads, &args, &output_maps);
+            let flanking_base_map: DashMap<u64, [[u64; 4]; 2]> = DashMap::new();
+            let mapping_data = map_kmers(&kmers, &ref_index, &viral_metadata, &args.threads, &args, &output_maps, &flanking_base_map);
+            trace!("Collected flanking base counts for {} buckets", flanking_base_map.len());
 
             //select the best genome from the mapping data
             info!("Selecting the most representative genome");
@@ -379,6 +381,10 @@ pub fn call(args: CallArgs) {
                 error!("Failed to find mapping data for selected genome");
                 std::process::exit(1);
             });
+
+            let breakpoints = identify_indel_breakpoints(output, output_rev, args.indel_window, args.indel_zscore, args.indel_min_depth as u64, args.indel_neighbor_max_depth as u64);
+            info!("Identified {} potential indel breakpoints", breakpoints.len());
+            trace!("Indel breakpoints: {:?}", breakpoints);
 
             let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
                 &args,
@@ -444,8 +450,10 @@ pub fn call(args: CallArgs) {
             info!("Initializing mapping arrays");
             let output_maps = initialize_output_maps(&viral_metadata);
             info!("Mapping kmers to all genomes");
-            let mapping_data_r1 = map_kmers(&kmers1, &ref_index, &viral_metadata, &half_threads, &args, &output_maps);
-            let mapping_data_r2 = map_kmers(&kmers2, &ref_index, &viral_metadata, &half_threads, &args, &output_maps);
+            let flanking_base_map: DashMap<u64, [[u64; 4]; 2]> = DashMap::new();
+            let mapping_data_r1 = map_kmers(&kmers1, &ref_index, &viral_metadata, &half_threads, &args, &output_maps, &flanking_base_map);
+            let mapping_data_r2 = map_kmers(&kmers2, &ref_index, &viral_metadata, &half_threads, &args, &output_maps, &flanking_base_map);
+            trace!("Collected flanking base counts for {} buckets", flanking_base_map.len());
 
             info!("Selecting the most representative genome");
             let best_genome_index = pick_best_genome_paired(&mapping_data_r1, &mapping_data_r2, &viral_metadata).unwrap_or_else(|| {
@@ -476,6 +484,10 @@ pub fn call(args: CallArgs) {
                 error!("Failed to find mapping data for selected genome");
                 std::process::exit(1);
             });
+
+            let breakpoints = identify_indel_breakpoints(output, output_rev, args.indel_window, args.indel_zscore, args.indel_min_depth as u64, args.indel_neighbor_max_depth as u64);
+            info!("Identified {} potential indel breakpoints", breakpoints.len());
+            trace!("Indel breakpoints: {:?}", breakpoints);
 
             let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
                 &args,
@@ -1181,8 +1193,115 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
 
 }
 
+#[derive(Debug, Clone)]
+pub struct Breakpoint {
+    pub pos: usize,    // 1-based position at the center of the window
+    pub direction: i8, // +1 for a rise in depth, -1 for a drop
+    pub z: f64,        // z-score of the center log-change within its window
+}
+
+// Streaming detection of potential indel breakpoints in the selected genome's pileup.
+// For each position we take the log change in major-allele depth (fwd+rev) relative to its
+// neighbor, maintain a rolling window of those changes, and flag the window's center when its
+// log change is a z-score outlier (|z| > z_min) relative to the window. Positions whose total
+// depth is below `min_depth` are not flagged.
+pub fn identify_indel_breakpoints(
+    output: &DashMap<String, OutputData>,
+    output_rev: &DashMap<String, OutputData>,
+    window: usize,
+    z_min: f64,
+    min_depth: u64,
+    neighbor_max_depth: u64,
+) -> Vec<Breakpoint> {
+    let mut breakpoints: Vec<Breakpoint> = Vec::new();
+
+    if window < 1 {
+        return breakpoints;
+    }
+
+    let c = 1.0_f64; // pseudocount so log-changes stay finite when depth hits zero
+
+    for entry in output.iter() {
+        let seq = entry.key();
+        let fwd = entry.value();
+        let rev = output_rev.get(seq).expect("Missing reverse strand for sequence");
+
+        let len = fwd.counts.len();
+        if len < 2 {
+            continue;
+        }
+
+        // major-allele depth (max base over fwd+rev) and total depth per position
+        let mut major = vec![0.0_f64; len];
+        let mut total = vec![0u64; len];
+        for i in 0..len {
+            let mut max_base = 0u64;
+            let mut sum = 0u64;
+            for b in 0..4 {
+                let d = fwd.counts[i][b] + rev.counts[i][b];
+                sum += d;
+                if d > max_base {
+                    max_base = d;
+                }
+            }
+            major[i] = max_base as f64;
+            total[i] = sum;
+        }
+
+        // rolling window over neighbor log-changes; d for position i is ln((major[i]+c)/(major[i-1]+c))
+        let half_window = window / 2;
+        let mut buf = vec![0.0_f64; window];
+        let mut s = 0.0_f64; // running sum of d in the window
+        let mut s2 = 0.0_f64; // running sum of squares of d in the window
+        let mut filled = 0usize;
+
+        for i in 1..len {
+            let d = ((major[i] + c) / (major[i - 1] + c)).ln();
+            let slot = (i - 1) % window;
+
+            if filled == window {
+                // evict the value leaving the window
+                let old = buf[slot];
+                s -= old;
+                s2 -= old * old;
+            } else {
+                filled += 1;
+            }
+            buf[slot] = d;
+            s += d;
+            s2 += d * d;
+
+            // once the window is full it covers d-values for positions (i-window+1 ..= i)
+            if filled == window {
+                let center = i - half_window; // position whose log-change we score
+                let center_d = buf[(center - 1) % window];
+
+                let mu = s / window as f64;
+                let var = (s2 / window as f64 - mu * mu).max(0.0);
+                let std = var.sqrt();
+
+                // require a genuine cliff: at least one flanking position drops below neighbor_max_depth
+                let cliff = total[center - 1] < neighbor_max_depth || total[center + 1] < neighbor_max_depth;
+
+                if std > 0.0 && total[center] >= min_depth && cliff {
+                    let z = (center_d - mu) / std;
+                    if z.abs() > z_min {
+                        breakpoints.push(Breakpoint {
+                            pos: center + 1, // 1-based
+                            direction: if center_d >= 0.0 { 1 } else { -1 },
+                            z,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    breakpoints
+}
+
 pub fn call_variants(
-    args: &CallArgs, 
+    args: &CallArgs,
     output: &DashMap<String, OutputData>,
     output_count: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
@@ -1496,24 +1615,35 @@ pub fn map_kmers(
             DashMap<String, OutputData>,
         ),
     >,
+    flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
 ) -> FxHashMap<u16, (usize, usize, usize)> {
     let k = args.kmer;
 
     //to store the number of kmers that are mapped perfectly or with 1-edit distance after all of the chunks
     //key is the index of the file in ViralMetadata, values are number of perfectly mapped and 1-edit distance kmers
     let results: DashMap<u16, (usize, usize, usize)> = DashMap::new();
-    
-    let chunk_size = if ((kmers.len() / threads) as usize) < 10000 { max(kmers.len() / threads, 100) as usize } else { 10000 };
+
+    let chunk_size =if ((kmers.len() / threads) as usize) < 10000 { max(kmers.len() / threads, 100) as usize } else { 10000 };
 
     kmers.par_chunks(chunk_size).for_each(|chunk| {
 
         //key is the index of the file in ViralMetadata, values are number of perfectly mapped and 1-edit distance kmers and unique perfectly mapped kmers
         let mut local_counts: FxHashMap<u16, (usize, usize, usize)> = FxHashMap::default(); //storing the number of perfectly mapped kmers (buckets found = len(filtered_buckets)) and variant mapped kmers (buckets found = 1) and unique perfect (perfect and only mapped to 1 genome) in thread
 
+        //thread-local accumulation of the first/last bucket base counts, indexed [rc][base] in ACGT order
+        let mut local_flanking: FxHashMap<u64, [[u64; 4]; 2]> = FxHashMap::default();
+
         for (kmer, n) in chunk {
 
             let (kmer_bin, rc) = canonical_kmer(kmer.as_bytes(), k);
             let buckets = assign_buckets(kmer_bin, k);
+
+            //record the first and last bucket of the kmer with the base of the first/last character (canonical orientation), depth-weighted by n
+            let rc_idx = rc as usize;
+            let first_base = ((kmer_bin >> (2 * (k - 1))) & 0b11) as usize;
+            let last_base = (kmer_bin & 0b11) as usize;
+            local_flanking.entry(buckets[0]).or_insert([[0u64; 4]; 2])[rc_idx][first_base] += *n;
+            local_flanking.entry(buckets[k - 1]).or_insert([[0u64; 4]; 2])[rc_idx][last_base] += *n;
 
             let filtered_buckets = if args.use_full_kmer {
                 buckets
@@ -1612,6 +1742,7 @@ pub fn map_kmers(
                         }    
                     }
                 }
+
             }
 
             // Identify perfect + unique hits
@@ -1654,6 +1785,20 @@ pub fn map_kmers(
                     e.2 += unique_perfect;
                 })
                 .or_insert((perfect, variant, unique_perfect));
+        }
+
+        // merge local flanking base counts into the global DashMap
+        for (bucket, counts) in local_flanking {
+            flanking_base_map
+                .entry(bucket)
+                .and_modify(|e| {
+                    for r in 0..2 {
+                        for b in 0..4 {
+                            e[r][b] += counts[r][b];
+                        }
+                    }
+                })
+                .or_insert(counts);
         }
     });
 
