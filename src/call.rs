@@ -382,9 +382,16 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let breakpoints = identify_indel_breakpoints(output, output_rev, args.indel_window, args.indel_zscore, args.indel_min_depth as u64, args.indel_neighbor_max_depth as u64);
-            info!("Identified {} potential indel breakpoints", breakpoints.len());
-            trace!("Indel breakpoints: {:?}", breakpoints);
+            let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_window, args.indel_zscore, args.indel_min_depth as u64, args.indel_neighbor_max_depth as u64);
+            let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
+            info!("Identified {} potential indel breakpoint pairs across {} sequences", n_pairs, breakpoint_pairs.len());
+            trace!("Indel breakpoint pairs: {:?}", breakpoint_pairs);
+
+            let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &breakpoint_pairs, args.kmer);
+            info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+            for indel in &reconstructed_indels {
+                info!("  indel {}:{}-{} allele: {}", indel.seq, indel.start, indel.end, String::from_utf8_lossy(&indel.allele));
+            }
 
             let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
                 &args,
@@ -485,9 +492,16 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let breakpoints = identify_indel_breakpoints(output, output_rev, args.indel_window, args.indel_zscore, args.indel_min_depth as u64, args.indel_neighbor_max_depth as u64);
-            info!("Identified {} potential indel breakpoints", breakpoints.len());
-            trace!("Indel breakpoints: {:?}", breakpoints);
+            let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_window, args.indel_zscore, args.indel_min_depth as u64, args.indel_neighbor_max_depth as u64);
+            let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
+            info!("Identified {} potential indel breakpoint pairs across {} sequences", n_pairs, breakpoint_pairs.len());
+            trace!("Indel breakpoint pairs: {:?}", breakpoint_pairs);
+
+            let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &breakpoint_pairs, args.kmer);
+            info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+            for indel in &reconstructed_indels {
+                info!("  indel {}:{}-{} allele: {}", indel.seq, indel.start, indel.end, String::from_utf8_lossy(&indel.allele));
+            }
 
             let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
                 &args,
@@ -1198,13 +1212,17 @@ pub struct Breakpoint {
     pub pos: usize,    // 1-based position at the center of the window
     pub direction: i8, // +1 for a rise in depth, -1 for a drop
     pub z: f64,        // z-score of the center log-change within its window
+    pub depth: u64,    // larger total depth of the two consecutive positions the change spans (high-coverage side)
 }
 
-// Streaming detection of potential indel breakpoints in the selected genome's pileup.
-// For each position we take the log change in major-allele depth (fwd+rev) relative to its
-// neighbor, maintain a rolling window of those changes, and flag the window's center when its
-// log change is a z-score outlier (|z| > z_min) relative to the window. Positions whose total
-// depth is below `min_depth` are not flagged.
+// Streaming detection of potential indel breakpoints in the selected genome's pileup, then pairs
+// them into candidate indels. For each position we take the log change in major-allele depth
+// (fwd+rev) relative to its neighbor, maintain a rolling window of those changes, and flag the
+// window's center when its log change is a z-score outlier (|z| > z_min) relative to the window.
+// Positions whose total depth is below `min_depth` are not flagged. Flagged breakpoints are then
+// paired as a drop (negative) followed by a rise (positive) within a reasonable distance, which is
+// the coverage signature of an indel. Returns the (drop, rise) pairs grouped by sequence name, so
+// multi-sequence genomes keep each pair associated with the sequence it was found on.
 pub fn identify_indel_breakpoints(
     output: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
@@ -1212,14 +1230,15 @@ pub fn identify_indel_breakpoints(
     z_min: f64,
     min_depth: u64,
     neighbor_max_depth: u64,
-) -> Vec<Breakpoint> {
-    let mut breakpoints: Vec<Breakpoint> = Vec::new();
+) -> Vec<(String, Vec<(Breakpoint, Breakpoint)>)> {
+    let mut grouped: Vec<(String, Vec<(Breakpoint, Breakpoint)>)> = Vec::new();
 
     if window < 1 {
-        return breakpoints;
+        return grouped;
     }
 
     let c = 1.0_f64; // pseudocount so log-changes stay finite when depth hits zero
+    let max_pair_distance = 100usize; // max distance between a drop and the following rise to pair them
 
     for entry in output.iter() {
         let seq = entry.key();
@@ -1230,6 +1249,9 @@ pub fn identify_indel_breakpoints(
         if len < 2 {
             continue;
         }
+
+        // breakpoints found within this sequence, in increasing position order
+        let mut breakpoints: Vec<Breakpoint> = Vec::new();
 
         // major-allele depth (max base over fwd+rev) and total depth per position
         let mut major = vec![0.0_f64; len];
@@ -1290,14 +1312,222 @@ pub fn identify_indel_breakpoints(
                             pos: center + 1, // 1-based
                             direction: if center_d >= 0.0 { 1 } else { -1 },
                             z,
+                            depth: total[center - 1].max(total[center]), // high-coverage side
                         });
                     }
                 }
             }
         }
+
+        // pair a drop (negative) with the next rise (positive) within max_pair_distance
+        let mut seq_pairs: Vec<(Breakpoint, Breakpoint)> = Vec::new();
+        let mut pending_drop: Option<Breakpoint> = None;
+        for bp in breakpoints {
+            match bp.direction {
+                -1 => pending_drop = Some(bp), // most recent drop opens a potential indel
+                1 => {
+                    if let Some(drop) = pending_drop.take() {
+                        if bp.pos.saturating_sub(drop.pos) <= max_pair_distance {
+                            seq_pairs.push((drop, bp));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !seq_pairs.is_empty() {
+            grouped.push((seq.clone(), seq_pairs));
+        }
     }
 
-    breakpoints
+    grouped
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconstructedIndel {
+    pub seq: String,
+    pub start: usize,    // drop breakpoint position (1-based)
+    pub end: usize,      // rise breakpoint position (1-based)
+    pub allele: Vec<u8>, // reconstructed sequence bridging the two anchors (ASCII bases)
+}
+
+// Sum the read support for extending a (k-1)-mer by each base, looking at both strands. Because the
+// flanking_base_map was keyed on canonical-kmer buckets, support for a forward extension can live in
+// either the forward bucket (rc=0 row) or the reverse-complement bucket (rc=1 row, complemented base).
+// `extend_right` extends a prefix to the right; `extend_right=false` extends a suffix to the left.
+// Returns per-base [A,C,G,T] summed counts.
+fn flanking_base_counts(
+    km1: u64,
+    k: usize,
+    flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
+    extend_right: bool,
+) -> [u64; 4] {
+    // build a full k-mer with a placeholder base at the free position (the bucket is invariant to it)
+    let full_fwd = if extend_right {
+        (km1 << 2) & ((1u64 << (2 * k)) - 1) // placeholder at the last position
+    } else {
+        km1 // placeholder (0) at the first position; km1 occupies the low k-1 bases
+    };
+    let rc_full = reverse_complement_u64(full_fwd, k);
+
+    let fwd_buckets = assign_buckets(full_fwd, k);
+    let rc_buckets = assign_buckets(rc_full, k);
+
+    // forward orientation uses the free-position bucket; rc orientation uses the mirrored bucket
+    let (b_fwd, b_rc) = if extend_right {
+        (fwd_buckets[k - 1], rc_buckets[0])
+    } else {
+        (fwd_buckets[0], rc_buckets[k - 1])
+    };
+
+    let fwd_row = flanking_base_map.get(&b_fwd).map(|r| *r); // copy the [[u64;4];2] out of the guard
+    let rc_row = flanking_base_map.get(&b_rc).map(|r| *r);
+
+    let mut counts = [0u64; 4];
+    for b in 0..4usize {
+        let cf = fwd_row.map(|x| x[0][b]).unwrap_or(0);
+        let cr = rc_row.map(|x| x[1][b ^ 0b11]).unwrap_or(0); // complement of b on the rc row
+        counts[b] = cf + cr;
+    }
+    counts
+}
+
+// Walk the de Bruijn graph implied by flanking_base_map to reconstruct the allele between a drop and
+// a rise breakpoint. Seeds with the reference (k-1)-mers flanking the gap, extends inward from each
+// side picking the major supported base (whose summed depth must fall within [DEPTH_LO, DEPTH_HI] x
+// the anchor depth), and succeeds when the two walks meet on a shared (k-1)-mer. Gives up after
+// MAX_EXT bases on either side or when no base passes the depth band.
+fn reconstruct_indel(
+    ref_bases: &[u8],
+    drop_pos: usize,
+    drop_depth: u64,
+    rise_pos: usize,
+    rise_depth: u64,
+    k: usize,
+    flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
+) -> Option<Vec<u8>> {
+    const MAX_EXT: usize = 20;
+    const DEPTH_LO: f64 = 0.5;
+    const DEPTH_HI: f64 = 2.0;
+
+    let km1 = k - 1;
+    let mask_km1 = (1u64 << (2 * km1)) - 1;
+
+    // pick the major extending base, accepted only if its summed support is within the depth band
+    let pick_base = |km1_val: u64, extend_right: bool, depth: u64| -> Option<u8> {
+        let counts = flanking_base_counts(km1_val, k, flanking_base_map, extend_right);
+        let (best_b, &best_c) = counts.iter().enumerate().max_by_key(|(_, c)| **c)?;
+        if best_c == 0 {
+            return None;
+        }
+        let lo = DEPTH_LO * depth as f64;
+        let hi = DEPTH_HI * depth as f64;
+        if (best_c as f64) < lo || (best_c as f64) > hi {
+            return None;
+        }
+        Some(best_b as u8)
+    };
+
+    // seeds from the reference: left (k-1)-mer ends at the last covered base before the drop,
+    // right (k-1)-mer starts at the first covered base after the rise
+    let left_end = drop_pos.checked_sub(2)?; // 0-based
+    if left_end + 1 < km1 {
+        return None;
+    }
+    let left_start = left_end + 1 - km1;
+    let right_start = rise_pos.checked_sub(1)?; // 0-based
+    if right_start + km1 > ref_bases.len() {
+        return None;
+    }
+
+    let left_seed = &ref_bases[left_start..=left_end];
+    let right_seed = &ref_bases[right_start..right_start + km1];
+
+    // RIGHT walk first (extending the right anchor leftward), recording each front (k-1)-mer node and
+    // the assembled sequence from that node onward, so the left walk can detect a meet.
+    let mut b_seq: Vec<u8> = right_seed.to_vec();
+    let mut right_nodes: FxHashMap<u64, Vec<u8>> = FxHashMap::default();
+    let mut r_node = kmer_to_u64(right_seed);
+    right_nodes.insert(r_node, b_seq.clone());
+    for _ in 0..MAX_EXT {
+        match pick_base(r_node, false, rise_depth) {
+            Some(b) => {
+                b_seq.insert(0, nucleotide_bits_to_char(b as u64) as u8);
+                r_node = ((b as u64) << (2 * (km1 - 1)) | (r_node >> 2)) & mask_km1;
+                right_nodes.entry(r_node).or_insert_with(|| b_seq.clone());
+            }
+            None => break,
+        }
+    }
+
+    // LEFT walk (extending the left anchor rightward), checking for a meet at each step
+    let mut a_seq: Vec<u8> = left_seed.to_vec();
+    let mut l_node = kmer_to_u64(left_seed);
+    if let Some(tail) = right_nodes.get(&l_node) {
+        return Some(splice_allele(&a_seq, tail, km1));
+    }
+    for _ in 0..MAX_EXT {
+        match pick_base(l_node, true, drop_depth) {
+            Some(b) => {
+                a_seq.push(nucleotide_bits_to_char(b as u64) as u8);
+                l_node = ((l_node << 2) | b as u64) & mask_km1;
+                if let Some(tail) = right_nodes.get(&l_node) {
+                    return Some(splice_allele(&a_seq, tail, km1));
+                }
+            }
+            None => break,
+        }
+    }
+
+    None
+}
+
+// Splice the left-assembled sequence with the right tail at their shared (k-1)-mer overlap.
+fn splice_allele(a_seq: &[u8], right_tail: &[u8], km1: usize) -> Vec<u8> {
+    let mut allele = a_seq.to_vec();
+    allele.extend_from_slice(&right_tail[km1..]); // skip the overlapping (k-1)-mer
+    allele
+}
+
+// General function for reconstructing indels -- does so for each breakpoint pair identified. The reference sequence is looked up by name from
+// the chosen genome's output table (carried once per group), so nothing extra needs to be passed in.
+pub fn reconstruct_indels(
+    output: &DashMap<String, OutputData>,
+    flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
+    grouped_pairs: &[(String, Vec<(Breakpoint, Breakpoint)>)],
+    k: usize,
+) -> Vec<ReconstructedIndel> {
+    let mut results: Vec<ReconstructedIndel> = Vec::new();
+
+    for (seq, pairs) in grouped_pairs {
+        let ref_entry = match output.get(seq) {
+            Some(e) => e,
+            None => continue,
+        };
+        let ref_bases = &ref_entry.ref_bases;
+
+        for (drop, rise) in pairs {
+            if let Some(allele) = reconstruct_indel(
+                ref_bases,
+                drop.pos,
+                drop.depth,
+                rise.pos,
+                rise.depth,
+                k,
+                flanking_base_map,
+            ) {
+                results.push(ReconstructedIndel {
+                    seq: seq.clone(),
+                    start: drop.pos,
+                    end: rise.pos,
+                    allele,
+                });
+            }
+        }
+    }
+
+    results
 }
 
 pub fn call_variants(
