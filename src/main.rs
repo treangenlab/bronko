@@ -7,6 +7,7 @@ use crate::consts::BRONKO_VERSION;
 
 pub mod consts;
 pub mod call;
+pub mod indels;
 pub mod lcb;
 pub mod build;
 pub mod util;
