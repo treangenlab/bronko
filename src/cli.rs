@@ -142,21 +142,21 @@ pub struct CallArgs {
     pub variant_multiplier: f64,
 
     //INDEL PARAMETERS
-    //window size for streaming breakpoint detection
-    #[clap(long="indel-window", default_value_t = DEFAULT_INDEL_WINDOW, help_heading="INDEL DETECTION", help="Window size (number of neighboring log-depth changes) used when z-scoring indel breakpoints")]
-    pub indel_window: usize,
-
-    //min |z-score| to flag a breakpoint
-    #[clap(long="indel-zscore", default_value_t = DEFAULT_INDEL_ZSCORE, help_heading="INDEL DETECTION", help="Minimum absolute z-score of the center log-depth change to flag a potential indel breakpoint")]
-    pub indel_zscore: f64,
+    //max ratio of low/high total depth between neighbors to flag a breakpoint
+    #[clap(long="indel-max-ratio", default_value_t = DEFAULT_INDEL_MAX_RATIO, help_heading="INDEL DETECTION", help="Flag an indel breakpoint when min/max total depth between two neighboring positions falls below this ratio (a sharp coverage cliff)")]
+    pub indel_max_ratio: f64,
 
     //min total depth at a position to consider a breakpoint
-    #[clap(long="indel-min-depth", default_value_t = DEFAULT_INDEL_MIN_DEPTH, help_heading="INDEL DETECTION", help="Minimum total depth at a position for it to be considered as an indel breakpoint")]
+    #[clap(long="indel-min-depth", default_value_t = DEFAULT_INDEL_MIN_DEPTH, help_heading="INDEL DETECTION", help="Minimum total depth to identify breakpoints for indel detection")]
     pub indel_min_depth: usize,
 
-    //max total depth of a flanking position for a breakpoint (enforces a coverage cliff)
-    #[clap(long="indel-neighbor-max-depth", default_value_t = DEFAULT_INDEL_NEIGHBOR_MAX_DEPTH, help_heading="INDEL DETECTION", help="At least one position flanking the breakpoint must have total depth below this value (enforces an actual coverage cliff)")]
-    pub indel_neighbor_max_depth: usize,
+    //max total depth after a coverage drop to consider a breakpoint
+    #[clap(long="indel-max-drop-depth", default_value_t = DEFAULT_INDEL_MAX_DROP_DEPTH, help_heading="INDEL DETECTION", help="Maximum total depth to be considered an indel breakpoint (the low side of a coverage cliff must be under this)")]
+    pub indel_max_drop_depth: usize,
+
+    #[clap(long="indel-width", default_value_t = DEFAULT_INDEL_WIDTH, help_heading="INDEL DETECTION", help="Maximum distance between a coverage drop and the following rise to be paired as an indel for reconstruction")]
+    pub indel_width: usize,
+
 
     //OUTPUT PARAMETERS
     //todo add output locations, output formats
