@@ -383,16 +383,24 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
-            let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
-            info!("Identified {} potential indel breakpoint pairs across {} sequences", n_pairs, breakpoint_pairs.len());
-            trace!("Indel breakpoint pairs: {:?}", breakpoint_pairs);
+            // reconstruct indels unless disabled; when disabled there are no indel alleles and the
+            // consensus stays indel-free
+            let reconstructed_indels = if args.no_indels {
+                info!("Indel reconstruction disabled (--no-indels)");
+                Vec::new()
+            } else {
+                let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
+                let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
+                info!("Identified {} potential indel breakpoint pairs across {} sequences", n_pairs, breakpoint_pairs.len());
+                trace!("Indel breakpoint pairs: {:?}", breakpoint_pairs);
 
-            let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &breakpoint_pairs, args.kmer);
-            info!("Reconstructed {} indel alleles", reconstructed_indels.len());
-            for indel in &reconstructed_indels {
-                info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
-            }
+                let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &breakpoint_pairs, args.kmer);
+                info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+                for indel in &reconstructed_indels {
+                    info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
+                }
+                reconstructed_indels
+            };
 
             let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
                 &args,
@@ -415,7 +423,7 @@ pub fn call(args: CallArgs) {
 
             //print consensus
             if args.output_consensus{
-                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index);
+                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &reconstructed_indels);
             }
 
             print_output(&se_read, &args, &variants, &viral_metadata, &best_genome_index);
@@ -493,16 +501,24 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
-            let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
-            info!("Identified {} potential indel breakpoint pairs across {} sequences", n_pairs, breakpoint_pairs.len());
-            trace!("Indel breakpoint pairs: {:?}", breakpoint_pairs);
+            // reconstruct indels unless disabled; when disabled there are no indel alleles and the
+            // consensus stays indel-free
+            let reconstructed_indels = if args.no_indels {
+                info!("Indel reconstruction disabled (--no-indels)");
+                Vec::new()
+            } else {
+                let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
+                let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
+                info!("Identified {} potential indel breakpoint pairs across {} sequences", n_pairs, breakpoint_pairs.len());
+                trace!("Indel breakpoint pairs: {:?}", breakpoint_pairs);
 
-            let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &breakpoint_pairs, args.kmer);
-            info!("Reconstructed {} indel alleles", reconstructed_indels.len());
-            for indel in &reconstructed_indels {
-                info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
-            }
+                let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &breakpoint_pairs, args.kmer);
+                info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+                for indel in &reconstructed_indels {
+                    info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
+                }
+                reconstructed_indels
+            };
 
             let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
                 &args,
@@ -525,7 +541,7 @@ pub fn call(args: CallArgs) {
 
             //print consensus
             if args.output_consensus{
-                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index);
+                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &reconstructed_indels);
             }
 
             print_output(&r1, &args, &variants, &viral_metadata, &best_genome_index);
@@ -878,7 +894,8 @@ pub fn print_consensus(
     output: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
     viral_metadata: &ViralMetadata,
-    best_genome_index: &u16, 
+    best_genome_index: &u16,
+    reconstructed_indels: &[ReconstructedIndel],
 ){
     info!("Writing output to pileup");
 
@@ -894,16 +911,14 @@ pub fn print_consensus(
 
     let bases = [b'A', b'C', b'G', b'T'];
 
-    let mut line_len: usize = 0;
-
     for seq_entry in &file_meta.sequences {
         let seq = &seq_entry.name;
 
         let fwd = output.get(seq).expect("Could not match seq to fwd counts");
         let rev = output_rev.get(seq).expect("Could not match seq to rev counts");
 
-        writeln!(writer, ">{}", seq).unwrap();
-
+        // build the per-position majority-base consensus (reference coordinates)
+        let mut consensus: Vec<u8> = Vec::with_capacity(fwd.ref_bases.len());
         for (i, _) in fwd.ref_bases.iter().enumerate() {
             let row = fwd.counts[i];
             let row_rev = rev.counts[i];
@@ -920,19 +935,19 @@ pub fn print_consensus(
                 bases[max_i]
             };
 
-            writer.write_all(&[consensus_base]).unwrap();
-            line_len += 1;
-
-            if line_len == DEFAULT_LINE_WRAP {
-                writer.write_all(b"\n").unwrap();
-                line_len = 0;
-            }
-
+            consensus.push(consensus_base);
         }
 
-        if line_len != 0 {
-            writer.write_all(b"\n\n").unwrap();
+        // splice the reconstructed indels for this sequence into the consensus (footprints share the
+        // reference coordinate system, so they line up with the consensus buffer)
+        let final_seq = splice_indels(&consensus, seq, reconstructed_indels);
+
+        writeln!(writer, ">{}", seq).unwrap();
+        for chunk in final_seq.chunks(DEFAULT_LINE_WRAP) {
+            writer.write_all(chunk).unwrap();
+            writer.write_all(b"\n").unwrap();
         }
+        writer.write_all(b"\n").unwrap(); // blank line between sequences
     }
 }
 

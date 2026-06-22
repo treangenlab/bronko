@@ -142,6 +142,10 @@ pub struct CallArgs {
     pub variant_multiplier: f64,
 
     //INDEL PARAMETERS
+    //disable indel reconstruction entirely (consensus will not contain indels)
+    #[clap(long="no-indels", default_value_t = DEFAULT_NO_INDELS, help_heading="INDEL DETECTION", help="Disable indel detection and reconstruction (the consensus sequence will not contain indels)")]
+    pub no_indels: bool,
+
     //max ratio of low/high total depth between neighbors to flag a breakpoint
     #[clap(long="indel-max-ratio", default_value_t = DEFAULT_INDEL_MAX_RATIO, help_heading="INDEL DETECTION", help="Flag an indel breakpoint when min/max total depth between two neighboring positions falls below this ratio (a sharp coverage cliff)")]
     pub indel_max_ratio: f64,

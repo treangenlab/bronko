@@ -343,3 +343,51 @@ pub fn reconstruct_indels(
 
     results
 }
+
+// Splice the indels belonging to `seq_name` into a coordinate-matched base buffer `bases` (the raw
+// reference or a per-position consensus -- both share the same length and reference coordinates),
+// returning the rebuilt sequence. Each indel's `allele` replaces its 1-based inclusive footprint
+// [ref_start, ref_end]; since the allele carries the matching anchor k-mer flanks it drops straight in.
+// Indels are assumed non-overlapping (overlapping ones will later be reconstructed as a single event);
+// we still sort by position and skip any whose footprint overlaps an already-applied one so a stray
+// overlap can't corrupt the output.
+pub fn splice_indels(bases: &[u8], seq_name: &str, indels: &[ReconstructedIndel]) -> Vec<u8> {
+    let mut seq_indels: Vec<&ReconstructedIndel> =
+        indels.iter().filter(|i| i.seq == seq_name).collect();
+    seq_indels.sort_by_key(|i| i.ref_start);
+
+    let mut new_seq: Vec<u8> = Vec::with_capacity(bases.len());
+    let mut cursor = 0usize; // 0-based index of the next base to copy
+    for indel in seq_indels {
+        // 1-based inclusive [ref_start, ref_end] -> 0-based [start, end)
+        if indel.ref_start < 1 || indel.ref_end > bases.len() || indel.ref_start > indel.ref_end {
+            continue; // malformed footprint
+        }
+        let start = indel.ref_start - 1;
+        let end = indel.ref_end; // exclusive
+        if start < cursor {
+            continue; // overlaps an already-applied indel; skip (non-overlapping assumed)
+        }
+        new_seq.extend_from_slice(&bases[cursor..start]); // bases up to the footprint
+        new_seq.extend_from_slice(&indel.allele); // the reconstructed allele
+        cursor = end;
+    }
+    new_seq.extend_from_slice(&bases[cursor..]); // remaining tail
+
+    new_seq
+}
+
+// Splice every reconstructed indel into the selected genome's reference sequence(s), returning the
+// rebuilt sequences as (name, bases). Sequences with no indels pass through unchanged.
+pub fn apply_indels_to_reference(
+    output: &DashMap<String, OutputData>,
+    indels: &[ReconstructedIndel],
+) -> Vec<(String, Vec<u8>)> {
+    let mut rebuilt: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in output.iter() {
+        let seq = entry.key();
+        let new_seq = splice_indels(&entry.value().ref_bases, seq, indels);
+        rebuilt.push((seq.clone(), new_seq));
+    }
+    rebuilt
+}
