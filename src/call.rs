@@ -1194,7 +1194,22 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, MNV, INS, DEL)\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
-    for variant in variants{
+    // sort records by contig (in the order contigs are declared above) then by position, so the
+    // separately-appended indel records interleave with the SNVs instead of trailing at the end
+    let contig_order: FxHashMap<&str, usize> = file_meta
+        .sequences
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+    let mut sorted: Vec<&VCFRecord> = variants.iter().collect();
+    sorted.sort_by(|a, b| {
+        let ai = contig_order.get(a.seq.as_str()).copied().unwrap_or(usize::MAX);
+        let bi = contig_order.get(b.seq.as_str()).copied().unwrap_or(usize::MAX);
+        ai.cmp(&bi).then(a.pos.cmp(&b.pos))
+    });
+
+    for variant in sorted{
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
         writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};TYPE={}",
             seq_out,
