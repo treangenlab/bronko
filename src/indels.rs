@@ -391,3 +391,60 @@ pub fn apply_indels_to_reference(
     }
     rebuilt
 }
+
+// A coordinate translation, for one sequence, between an indel-corrected sequence (consensus + spliced
+// indels) and the original reference. All positions are 0-based.
+//   - `corrected_to_orig[i]` = the original-reference position corrected position `i` came from, or
+//     None if `i` lies inside a spliced-in indel allele (no direct reference coordinate).
+//   - `orig_to_corrected[j]` = the corrected position original base `j` maps to, or None if `j` fell
+//     inside an indel footprint that was replaced wholesale.
+// The two `None` regions are duals: an indel replaces original footprint [ref_start, ref_end] with its
+// allele, so the footprint has no corrected coordinate and the allele has no original coordinate.
+#[derive(Debug, Clone)]
+pub struct CoordMap {
+    pub corrected_to_orig: Vec<Option<usize>>,
+    pub orig_to_corrected: Vec<Option<usize>>,
+}
+
+// Build the coordinate map for `seq_name`. `ref_len` is the original reference length (also the length
+// of the per-position consensus before splicing). Mirrors `splice_indels`: copied reference runs map
+// 1:1 while the offset accumulates across indels; overlapping/malformed indels are skipped identically
+// so the map stays consistent with the spliced sequence.
+pub fn build_coord_map(ref_len: usize, seq_name: &str, indels: &[ReconstructedIndel]) -> CoordMap {
+    let mut seq_indels: Vec<&ReconstructedIndel> =
+        indels.iter().filter(|i| i.seq == seq_name).collect();
+    seq_indels.sort_by_key(|i| i.ref_start);
+
+    let mut corrected_to_orig: Vec<Option<usize>> = Vec::with_capacity(ref_len);
+    let mut orig_to_corrected: Vec<Option<usize>> = vec![None; ref_len];
+
+    let mut cursor = 0usize; // next original 0-based base to copy
+    for indel in seq_indels {
+        if indel.ref_start < 1 || indel.ref_end > ref_len || indel.ref_start > indel.ref_end {
+            continue; // malformed footprint
+        }
+        let start = indel.ref_start - 1; // 0-based inclusive
+        let end = indel.ref_end; // 0-based exclusive
+        if start < cursor {
+            continue; // overlaps an already-applied indel; skip (matches splice_indels)
+        }
+        // copied run [cursor, start): 1:1 in both directions
+        for orig in cursor..start {
+            orig_to_corrected[orig] = Some(corrected_to_orig.len());
+            corrected_to_orig.push(Some(orig));
+        }
+        // allele span: corrected positions with no original coordinate
+        for _ in 0..indel.allele.len() {
+            corrected_to_orig.push(None);
+        }
+        // footprint [start, end) originals already left as None in orig_to_corrected
+        cursor = end;
+    }
+    // tail [cursor, ref_len): 1:1
+    for orig in cursor..ref_len {
+        orig_to_corrected[orig] = Some(corrected_to_orig.len());
+        corrected_to_orig.push(Some(orig));
+    }
+
+    CoordMap { corrected_to_orig, orig_to_corrected }
+}
