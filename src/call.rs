@@ -479,7 +479,7 @@ pub fn call(args: CallArgs) {
             if let Some(coord_maps) = coord_maps_opt {
                 for indel in &reconstructed_indels {
                     if let Some(coord_map) = coord_maps.get(&indel.seq) {
-                        if let Some(rec) = indel_to_vcf_record(indel, output, cur_output, cur_output_rev, coord_map) {
+                        if let Some(rec) = indel_to_vcf_record(indel, output, output_rev, cur_output, cur_output_rev, coord_map) {
                             match rec.var_type() {
                                 "INS" => num_insertions += 1,
                                 "DEL" => num_deletions += 1,
@@ -678,7 +678,7 @@ pub fn call(args: CallArgs) {
             if let Some(coord_maps) = coord_maps_opt {
                 for indel in &reconstructed_indels {
                     if let Some(coord_map) = coord_maps.get(&indel.seq) {
-                        if let Some(rec) = indel_to_vcf_record(indel, output, cur_output, cur_output_rev, coord_map) {
+                        if let Some(rec) = indel_to_vcf_record(indel, output, output_rev, cur_output, cur_output_rev, coord_map) {
                             match rec.var_type() {
                                 "INS" => num_insertions += 1,
                                 "DEL" => num_deletions += 1,
@@ -1254,25 +1254,45 @@ impl VCFRecord {
 }
 
 // Build a VCF record for a reconstructed indel. REF is the original-reference footprint the allele
-// replaced and ALT is the reconstructed allele; depth and per-strand support are pulled from the
-// second-pass (corrected consensus) pileup at the weakest-covered position spanning the spliced-in
-// allele. The shared flanks are then trimmed down to a single anchor base for a compact representation,
-// and the start coordinate is reported in the original reference. Returns None if the indel can't be
-// located/translated (e.g. footprint out of range or abutting another indel).
+// replaced and ALT is the reconstructed allele. The two alleles drop out of opposite pileups, so each
+// is measured where it maps cleanly: the REF allele (reads without the indel) from the first-pass
+// pileup over the disrupted footprint, and the ALT allele (reads with the indel) from the second-pass
+// (corrected consensus) pileup over the spliced-in allele. Each side takes the weakest (minimum total
+// depth) position across its span, which lands in the disrupted region rather than the well-covered
+// anchors. Those per-strand counts give DP4, AF, DP and the strand odds ratio. The shared flanks are
+// then trimmed to a single anchor base and the start is reported in the original reference. Returns
+// None if the indel can't be located/translated (e.g. footprint out of range or abutting another indel).
 fn indel_to_vcf_record(
     indel: &ReconstructedIndel,
     orig_output: &DashMap<String, OutputData>,
+    orig_output_rev: &DashMap<String, OutputData>,
     new_output: &DashMap<String, OutputData>,
     new_output_rev: &DashMap<String, OutputData>,
     coord_map: &CoordMap,
 ) -> Option<VCFRecord> {
-    // REF allele: original reference bases over the 1-based inclusive footprint [ref_start, ref_end]
-    let ref_allele = {
+    // REF allele: original reference bases over the 1-based inclusive footprint [ref_start, ref_end], plus
+    // the first-pass reference-allele support. The reference allele is what still covers the disrupted
+    // footprint in the first pass; the minimum-depth position lands in the dip (the deleted bases for a
+    // deletion, or the junction dip for an insertion).
+    let (ref_allele, ref_fwd, ref_rev) = {
         let orig = orig_output.get(&indel.seq)?;
+        let orig_rev = orig_output_rev.get(&indel.seq)?;
         if indel.ref_start < 1 || indel.ref_end > orig.ref_bases.len() || indel.ref_start > indel.ref_end {
             return None;
         }
-        orig.ref_bases[indel.ref_start - 1..indel.ref_end].to_vec()
+        let ref_allele = orig.ref_bases[indel.ref_start - 1..indel.ref_end].to_vec();
+
+        let mut rep = indel.ref_start - 1;
+        let mut min_total = u64::MAX;
+        for p in (indel.ref_start - 1)..indel.ref_end {
+            let total: u64 = (0..4).map(|b| orig.counts[p][b] + orig_rev.counts[p][b]).sum();
+            if total < min_total {
+                min_total = total;
+                rep = p;
+            }
+        }
+        let ref_base = nt_to_bits(orig.ref_bases[rep]) as usize;
+        (ref_allele, orig.counts[rep][ref_base], orig_rev.counts[rep][ref_base])
     };
 
     // locate the allele in corrected coordinates: it begins just after the corrected position of the
@@ -1283,30 +1303,32 @@ fn indel_to_vcf_record(
         0
     };
 
-    let fwd = new_output.get(&indel.seq)?;
-    let rev = new_output_rev.get(&indel.seq)?;
-    let c_end = (c_start + indel.allele.len()).min(fwd.counts.len());
-    if c_start >= c_end {
-        return None;
-    }
-
-    // representative support = the weakest (minimum total depth) position spanning the allele
-    let mut rep_pos = c_start;
-    let mut min_total = u64::MAX;
-    for p in c_start..c_end {
-        let total: u64 = (0..4).map(|b| fwd.counts[p][b] + rev.counts[p][b]).sum();
-        if total < min_total {
-            min_total = total;
-            rep_pos = p;
+    // ALT allele: second-pass support over the spliced-in allele, again at the weakest spanning position
+    let (alt_fwd, alt_rev) = {
+        let fwd = new_output.get(&indel.seq)?;
+        let rev = new_output_rev.get(&indel.seq)?;
+        let c_end = (c_start + indel.allele.len()).min(fwd.counts.len());
+        if c_start >= c_end {
+            return None;
         }
-    }
+        let mut rep = c_start;
+        let mut min_total = u64::MAX;
+        for p in c_start..c_end {
+            let total: u64 = (0..4).map(|b| fwd.counts[p][b] + rev.counts[p][b]).sum();
+            if total < min_total {
+                min_total = total;
+                rep = p;
+            }
+        }
+        let alt_base = nt_to_bits(fwd.ref_bases[rep]) as usize;
+        (fwd.counts[rep][alt_base], rev.counts[rep][alt_base])
+    };
 
-    // the corrected consensus base at the representative position is the alt (indel) base there
-    let alt_base = nt_to_bits(fwd.ref_bases[rep_pos]) as usize;
-    let fwd_alt = fwd.counts[rep_pos][alt_base];
-    let rev_alt = rev.counts[rep_pos][alt_base];
-    let depth = min_total;
-    let af = if depth > 0 { (fwd_alt + rev_alt) as f64 / depth as f64 } else { 0.0 };
+    let ref_total = ref_fwd + ref_rev;
+    let alt_total = alt_fwd + alt_rev;
+    let depth = ref_total + alt_total;
+    let af = if depth > 0 { alt_total as f64 / depth as f64 } else { 0.0 };
+    let sor = strand_odds_ratio(ref_fwd, ref_rev, alt_fwd, alt_rev);
 
     // trim the shared suffix entirely, then the shared prefix down to a single anchor base, shifting the
     // reported start past the trimmed prefix (standard compact indel representation)
@@ -1340,13 +1362,13 @@ fn indel_to_vcf_record(
         pos,
         ref_allele: ref_a,
         alt_allele: alt_a,
-        fwd_ref: 0,
-        rev_ref: 0,
-        fwd_alt,
-        rev_alt,
+        fwd_ref: ref_fwd,
+        rev_ref: ref_rev,
+        fwd_alt: alt_fwd,
+        rev_alt: alt_rev,
         depth,
         af,
-        sor: -1.0, // strand odds ratio not evaluated for reconstructed indels
+        sor,
     })
 }
 
@@ -1528,6 +1550,21 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
 
 }
 
+// GATK strand odds ratio from a 2x2 strand table (ref/alt x fwd/rev), with +1 pseudocounts so it is
+// always defined. Higher values indicate stronger strand bias.
+fn strand_odds_ratio(ref_fwd: u64, ref_rev: u64, alt_fwd: u64, alt_rev: u64) -> f64 {
+    let a = ref_fwd as f64 + 1.0; // ref fwd
+    let b = ref_rev as f64 + 1.0; // ref rev
+    let c = alt_fwd as f64 + 1.0; // alt fwd
+    let d = alt_rev as f64 + 1.0; // alt rev
+
+    let r = (a * d) / (b * c);
+    let ref_ratio = a.min(b) / a.max(b);
+    let alt_ratio = c.min(d) / c.max(d);
+
+    (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln()
+}
+
 pub fn call_variants(
     args: &CallArgs,
     output: &DashMap<String, OutputData>,
@@ -1641,14 +1678,10 @@ pub fn call_variants(
 
                     //if the strand balance filter is on (default), then always do SOR filter
                     //if the strand balance filter is off, then only do SOR filter when 1 strand is > strand_balance_ratio of total depth (by default 10% of total depth, aka all cases where 1 strand is less than 10% of the total depth are ignored)
-                    if (!args.no_strand_balance_filter) | ((args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) { 
-                        
+                    if (!args.no_strand_balance_filter) | ((args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) {
+
                         //Using GATK strand odds ratio
-                        let r = (a*d)/(b*c);
-                        let ref_ratio = (a.min(b)) / (a.max(b));
-                        let alt_ratio = (c.min(d)) / (c.max(d));
-                        
-                        sor = (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln(); 
+                        sor = strand_odds_ratio(row[ref_base as usize], row_rev[ref_base as usize], row[alt_base as usize], row_rev[alt_base as usize]);
 
                         // filter out if greater than strand odds ratio (default 8)
                         if sor > args.strand_odds_max {
