@@ -1633,22 +1633,15 @@ pub fn call_variants(
                 continue; // skip non-ACGT
             }
 
-            // on the second pass, `i` is a corrected-consensus coordinate; translate it back to the
-            // original reference. Positions inside a reconstructed indel have no original coordinate, so
-            // they are skipped here (the indel itself is reported as its own record).
-            let pos = match coord_map {
-                Some(maps) => match maps.get(seq).and_then(|m| m.corrected_to_orig.get(i).copied().flatten()) {
-                    Some(o) => o + 1, // 1-based original coordinate
-                    None => continue,
-                },
-                None => i + 1,
-            };
-
             // calculate the depths, including those of fwd and reverse, find the min and max of the two for strand filtering purposes
             let row_total: Vec<u64> = (0..4)
                 .map(|b| row[b] + row_rev[b])
                 .collect();
 
+            // tally coverage here, before any coord translation, so breadth/depth are computed the same
+            // way regardless of pass -- over every covered position of whichever pileup table was passed
+            // in. On the second pass this includes positions inside a reconstructed indel allele, which
+            // are real covered positions of the corrected consensus.
             let total_depth = row_total.iter().sum();
             if total_depth == 0 {
                 continue; //maybe replace down the line with logic to fix things
@@ -1656,6 +1649,17 @@ pub fn call_variants(
                 positions_covered += 1;
                 total_coverage += total_depth as usize;
             }
+
+            // on the second pass, `i` is a corrected-consensus coordinate; translate it back to the
+            // original reference. Positions inside a reconstructed indel have no original coordinate, so
+            // they are skipped for variant calling (the indel itself is reported as its own record).
+            let pos = match coord_map {
+                Some(maps) => match maps.get(seq).and_then(|m| m.corrected_to_orig.get(i).copied().flatten()) {
+                    Some(o) => o + 1, // 1-based original coordinate
+                    None => continue,
+                },
+                None => i + 1,
+            };
 
             // loop through each base and variant call if not the reference base
             for alt_base in 0u8..4 {
