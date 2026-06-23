@@ -344,6 +344,166 @@ pub fn reconstruct_indels(
     results
 }
 
+// Walk the de Bruijn graph implied by flanking_base_map outward from a single anchor k-mer, always
+// taking the major-supported base, to reconstruct a sequence end. `extend_right` walks toward the 3'
+// terminus (appending bases); `extend_right=false` walks toward the 5' start (prepending bases). Unlike
+// the internal bridge there is no second anchor to meet, so the walk simply continues as far as there is
+// read evidence: it stops after `max_extension` bases (the caller bounds this by the reference length so
+// we never extend past it), or at a dead end where the best extending base has no support. The returned
+// bases are in left-to-right reference order regardless of direction.
+fn reconstruct_end(
+    anchor_kmer: &[u8],
+    extend_right: bool,
+    max_extension: usize,
+    k: usize,
+    flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
+) -> Vec<u8> {
+    if anchor_kmer.len() != k || k < 2 {
+        return Vec::new();
+    }
+
+    let mask_k = (1u64 << (2 * k)) - 1;
+    let mask_km1 = (1u64 << (2 * (k - 1))) - 1;
+    let shift_km1 = 2 * (k - 1);
+
+    let mut cur = kmer_to_u64(anchor_kmer);
+    let mut bases: Vec<u8> = Vec::new();
+
+    for _ in 0..max_extension {
+        // the (k-1)-mer the next base attaches to: trailing suffix when extending right, leading prefix
+        // when extending left
+        let km1 = if extend_right { cur & mask_km1 } else { cur >> 2 };
+        let counts = flanking_base_counts(km1, k, flanking_base_map, extend_right);
+
+        // pick the best-supported extending base (first max on ties)
+        let mut best_b = 0usize;
+        let mut best_c = 0u64;
+        for (b, &c) in counts.iter().enumerate() {
+            if c > best_c {
+                best_c = c;
+                best_b = b;
+            }
+        }
+        if best_c == 0 {
+            break; // dead end: no read evidence to extend further
+        }
+
+        let b = best_b as u64;
+        if extend_right {
+            cur = ((cur << 2) | b) & mask_k;
+        } else {
+            cur = (b << shift_km1) | (cur >> 2);
+        }
+        bases.push(nucleotide_bits_to_char(b) as u8);
+    }
+
+    if !extend_right {
+        bases.reverse(); // collected nearest-anchor-first; flip to left-to-right reference order
+    }
+    bases
+}
+
+// Reconstruct the 5' and/or 3' ends of each sequence as a generalization of indel reconstruction. Where
+// the internal case bridges between a drop and a rise, an end has only one side: we anchor a k-mer just
+// inside the confidently-covered region (the first/last position reaching `min_depth`, pulled in by
+// END_ANCHOR_MARGIN) and walk the de Bruijn graph outward toward the terminus, as far as read evidence
+// carries. The reference length is used as a proxy for how far to go -- the walk is capped at the
+// reference boundary and never extends past it. Each reconstructed end is returned as a length-preserving
+// substitution (a ReconstructedIndel whose footprint exactly spans the rebuilt region) so it can be
+// spliced through the same machinery as internal indels, but it is meant only to improve the consensus
+// we re-map to: the caller does not report or count it as a variant. Because it is length-preserving it
+// leaves coordinates unchanged for everything else. Any terminal bases the walk could not reach are left
+// untouched, so they remain as the consensus produces them -- N where there is no coverage.
+pub fn reconstruct_ends(
+    output: &DashMap<String, OutputData>,
+    output_rev: &DashMap<String, OutputData>,
+    flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
+    k: usize,
+    min_depth: u64,
+) -> Vec<ReconstructedIndel> {
+    const END_ANCHOR_MARGIN: usize = 2; // pull the anchor this far inside the confidently-covered region
+
+    let mut results: Vec<ReconstructedIndel> = Vec::new();
+
+    for entry in output.iter() {
+        let seq = entry.key();
+        let fwd = entry.value();
+        let rev = match output_rev.get(seq) {
+            Some(r) => r,
+            None => continue,
+        };
+        let ref_bases = &fwd.ref_bases;
+        let len = ref_bases.len();
+        if len < 2 * k {
+            continue; // too short to anchor and reconstruct meaningfully
+        }
+
+        // total depth (fwd+rev across all bases) per position
+        let total: Vec<u64> = (0..len)
+            .map(|i| (0..4).map(|b| fwd.counts[i][b] + rev.counts[i][b]).sum())
+            .collect();
+
+        let first_good = total.iter().position(|&d| d >= min_depth);
+        let last_good = total.iter().rposition(|&d| d >= min_depth);
+
+        // ---- 5' start: anchor just inside the first covered position, walk left toward position 0 ----
+        if let Some(fg) = first_good {
+            if fg > 0 {
+                let anchor_start = fg + END_ANCHOR_MARGIN; // 0-based first base of the anchor k-mer
+                let anchor_end = anchor_start + k - 1;      // 0-based last base
+                if anchor_end < len {
+                    let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
+                    // walk left at most `anchor_start` bases (reaching position 0 = the reference start)
+                    let head = reconstruct_end(anchor_kmer, false, anchor_start, k, flanking_base_map);
+                    if !head.is_empty() {
+                        // footprint exactly spans the rebuilt region [anchor_start - head.len(), anchor_end]
+                        let ref_start = anchor_start - head.len() + 1; // 1-based
+                        let mut allele = head;
+                        allele.extend_from_slice(anchor_kmer);
+                        results.push(ReconstructedIndel {
+                            seq: seq.clone(),
+                            drop_pos: 1,
+                            rise_pos: fg + 1,
+                            ref_start,
+                            ref_end: anchor_end + 1,
+                            allele,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ---- 3' end: anchor just inside the last covered position, walk right toward the terminus ----
+        if let Some(lg) = last_good {
+            if lg + 1 < len && lg >= END_ANCHOR_MARGIN {
+                let anchor_end = lg - END_ANCHOR_MARGIN; // 0-based last base of the anchor k-mer
+                if anchor_end + 1 >= k {
+                    let anchor_start = anchor_end + 1 - k; // 0-based first base
+                    let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
+                    let max_ext = (len - 1) - anchor_end; // reach the last reference position at most
+                    let tail = reconstruct_end(anchor_kmer, true, max_ext, k, flanking_base_map);
+                    if !tail.is_empty() {
+                        // footprint exactly spans the rebuilt region [anchor_start, anchor_end + tail.len()]
+                        let ref_end = anchor_end + tail.len() + 1; // 1-based
+                        let mut allele = anchor_kmer.to_vec();
+                        allele.extend_from_slice(&tail);
+                        results.push(ReconstructedIndel {
+                            seq: seq.clone(),
+                            drop_pos: lg + 1,
+                            rise_pos: len,
+                            ref_start: anchor_start + 1,
+                            ref_end,
+                            allele,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
 // Splice the indels belonging to `seq_name` into a coordinate-matched base buffer `bases` (the raw
 // reference or a per-position consensus -- both share the same length and reference coordinates),
 // returning the rebuilt sequence. Each indel's `allele` replaces its 1-based inclusive footprint

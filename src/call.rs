@@ -385,11 +385,11 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            // reconstruct indels unless disabled; when disabled there are no indel alleles and the
-            // consensus stays indel-free
-            let reconstructed_indels = if args.no_indels {
+            // reconstruct indels and sequence ends unless disabled. Internal indels are reported and
+            // translated as variants; end reconstructions only improve the consensus we re-map to.
+            let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
                 info!("Indel reconstruction disabled (--no-indels)");
-                Vec::new()
+                (Vec::new(), Vec::new())
             } else {
                 let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
                 let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
@@ -401,13 +401,35 @@ pub fn call(args: CallArgs) {
                 for indel in &reconstructed_indels {
                     info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
                 }
-                reconstructed_indels
+
+                // generalize reconstruction to the sequence ends, for the consensus only (capped at the
+                // reference length; bases the walk can't reach stay as the consensus's N)
+                let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64);
+                info!("Reconstructed {} sequence end(s) for the consensus", reconstructed_ends.len());
+                for end in &reconstructed_ends {
+                    info!("  end {} (ref {}-{}) allele: {}", end.seq, end.ref_start, end.ref_end, String::from_utf8_lossy(&end.allele));
+                }
+
+                (reconstructed_indels, reconstructed_ends)
             };
 
-            //print consensus (also written whenever indels are present, since we re-index from it)
-            let has_indels = !reconstructed_indels.is_empty();
+            // the consensus we re-map to incorporates internal indels and end reconstructions; only the
+            // internal indels are reported/translated as variants. Ends are length-preserving, so the
+            // internal-indel-only coordinate map stays consistent with the spliced consensus. Drop any end
+            // that overlaps an internal indel footprint so the splice and that map stay in agreement.
+            let consensus_edits: Vec<ReconstructedIndel> = reconstructed_indels
+                .iter()
+                .cloned()
+                .chain(reconstructed_ends.iter().filter(|end| {
+                    !reconstructed_indels.iter().any(|ind| ind.seq == end.seq
+                        && end.ref_start <= ind.ref_end && ind.ref_start <= end.ref_end)
+                }).cloned())
+                .collect();
+
+            //print consensus (also written whenever there are edits, since we re-index from it)
+            let has_indels = !consensus_edits.is_empty();
             if args.output_consensus || has_indels {
-                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &reconstructed_indels);
+                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits);
             }
 
             // When indels were reconstructed, the consensus was rewritten with those indels spliced in:
@@ -581,11 +603,11 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            // reconstruct indels unless disabled; when disabled there are no indel alleles and the
-            // consensus stays indel-free
-            let reconstructed_indels = if args.no_indels {
+            // reconstruct indels and sequence ends unless disabled. Internal indels are reported and
+            // translated as variants; end reconstructions only improve the consensus we re-map to.
+            let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
                 info!("Indel reconstruction disabled (--no-indels)");
-                Vec::new()
+                (Vec::new(), Vec::new())
             } else {
                 let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
                 let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
@@ -597,13 +619,35 @@ pub fn call(args: CallArgs) {
                 for indel in &reconstructed_indels {
                     info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
                 }
-                reconstructed_indels
+
+                // generalize reconstruction to the sequence ends, for the consensus only (capped at the
+                // reference length; bases the walk can't reach stay as the consensus's N)
+                let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64);
+                info!("Reconstructed {} sequence end(s) for the consensus", reconstructed_ends.len());
+                for end in &reconstructed_ends {
+                    info!("  end {} (ref {}-{}) allele: {}", end.seq, end.ref_start, end.ref_end, String::from_utf8_lossy(&end.allele));
+                }
+
+                (reconstructed_indels, reconstructed_ends)
             };
 
-            //print consensus (also written whenever indels are present, since we re-index from it)
-            let has_indels = !reconstructed_indels.is_empty();
+            // the consensus we re-map to incorporates internal indels and end reconstructions; only the
+            // internal indels are reported/translated as variants. Ends are length-preserving, so the
+            // internal-indel-only coordinate map stays consistent with the spliced consensus. Drop any end
+            // that overlaps an internal indel footprint so the splice and that map stay in agreement.
+            let consensus_edits: Vec<ReconstructedIndel> = reconstructed_indels
+                .iter()
+                .cloned()
+                .chain(reconstructed_ends.iter().filter(|end| {
+                    !reconstructed_indels.iter().any(|ind| ind.seq == end.seq
+                        && end.ref_start <= ind.ref_end && ind.ref_start <= end.ref_end)
+                }).cloned())
+                .collect();
+
+            //print consensus (also written whenever there are edits, since we re-index from it)
+            let has_indels = !consensus_edits.is_empty();
             if args.output_consensus || has_indels {
-                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &reconstructed_indels);
+                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits);
             }
 
             // When indels were reconstructed, the consensus was rewritten with those indels spliced in:
