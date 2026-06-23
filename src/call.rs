@@ -9,7 +9,7 @@ use anyhow::{Result};
 use num_cpus;
 use log::*;
 use crate::consts::*;
-use rustc_hash::{FxHashMap};
+use rustc_hash::{FxHashMap, FxHashSet};
 use dashmap::DashMap;
 use bincode::{config};
 
@@ -426,10 +426,28 @@ pub fn call(args: CallArgs) {
                 }).cloned())
                 .collect();
 
-            //print consensus (also written whenever there are edits, since we re-index from it)
             let has_indels = !consensus_edits.is_empty();
+
+            // first-pass variant call: its major variants seed the consensus, and it is the final result
+            // when no second pass is needed
+            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
+                &args,
+                output,
+                output_counts,
+                output_rev,
+                output_rev_counts,
+                args.min_af,
+                !args.no_end_filter,
+                !args.no_strand_filter,
+                args.n_per_strand,
+                &best_genome_filename,
+                None, // first pass: original-reference coordinates
+            );
+
+            // print consensus (also written whenever there are edits, since we re-index from it): apply the
+            // first-pass called major variants over the reference, then splice in the reconstructed indels/ends
             if args.output_consensus || has_indels {
-                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits);
+                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
             }
 
             // When indels were reconstructed, the consensus was rewritten with those indels spliced in:
@@ -479,19 +497,66 @@ pub fn call(args: CallArgs) {
                     None => (output, output_rev, output_counts, output_rev_counts, &viral_metadata, best_genome_index, None),
                 };
 
-            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = call_variants(
-                &args,
-                cur_output,
-                cur_output_counts,
-                cur_output_rev,
-                cur_output_rev_counts,
-                args.min_af,
-                !args.no_end_filter,
-                !args.no_strand_filter,
-                args.n_per_strand,
-                &best_genome_filename,
-                coord_maps_opt, // second pass: translate corrected coords -> original reference
-            );
+            // final variants. With a second pass, the first-pass major SNVs are carried over (they were
+            // baked into the consensus, so the second pass no longer re-finds them), but recomputed against
+            // the second-pass pileup so their depth/AF/strand counts reflect the corrected mapping. The
+            // second pass contributes everything else -- minor variants and anything newly callable -- except
+            // where a first-pass major already reports that position. Without a second pass, the first-pass
+            // call is the final result as-is.
+            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
+                let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
+                    &args,
+                    cur_output,
+                    cur_output_counts,
+                    cur_output_rev,
+                    cur_output_rev_counts,
+                    args.min_af,
+                    !args.no_end_filter,
+                    !args.no_strand_filter,
+                    args.n_per_strand,
+                    &best_genome_filename,
+                    coord_maps_opt, // second pass: translate corrected coords -> original reference
+                );
+
+                let mut merged: Vec<VCFRecord> = Vec::new();
+                let mut major_keys: FxHashSet<(String, usize)> = FxHashSet::default();
+                for r in &first_pass_variants {
+                    if !(r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1) {
+                        continue; // only major SNVs are carried over from the first pass
+                    }
+                    major_keys.insert((r.seq.clone(), r.pos));
+                    let cm = match coord_maps.get(&r.seq) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // a position with no corrected coordinate lies inside a reconstructed indel and is
+                    // subsumed by that indel's record
+                    let corrected = match cm.orig_to_corrected.get(r.pos - 1).copied().flatten() {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // recompute against the second-pass pileup; if it has no coverage there, keep the
+                    // first-pass call
+                    match major_snv_second_pass_record(&r.seq, r.pos, corrected, r.ref_allele[0], r.alt_allele[0], cur_output, cur_output_rev) {
+                        Some(rec) => merged.push(rec),
+                        None => merged.push(r.clone()),
+                    }
+                }
+                // add the second-pass calls except where a first-pass major already reports that position
+                for r in sp_variants {
+                    if !major_keys.contains(&(r.seq.clone(), r.pos)) {
+                        merged.push(r);
+                    }
+                }
+
+                // recount SNVs from the merged set (indel records are added and counted separately below)
+                let num_major_snp = merged.iter().filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+                let num_minor_snp = merged.iter().filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+
+                (merged, num_major_snp, num_minor_snp, sp_breadth, sp_depth)
+            } else {
+                (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth)
+            };
             log_memory_usage(true, "Called variants successfully");
 
             // emit each reconstructed indel as its own VCF record (original-reference coordinates, depth
@@ -644,10 +709,28 @@ pub fn call(args: CallArgs) {
                 }).cloned())
                 .collect();
 
-            //print consensus (also written whenever there are edits, since we re-index from it)
             let has_indels = !consensus_edits.is_empty();
+
+            // first-pass variant call: its major variants seed the consensus, and it is the final result
+            // when no second pass is needed
+            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
+                &args,
+                output,
+                output_counts,
+                output_rev,
+                output_rev_counts,
+                args.min_af,
+                !args.no_end_filter,
+                !args.no_strand_filter,
+                args.n_per_strand,
+                &best_genome_filename,
+                None, // first pass: original-reference coordinates
+            );
+
+            // print consensus (also written whenever there are edits, since we re-index from it): apply the
+            // first-pass called major variants over the reference, then splice in the reconstructed indels/ends
             if args.output_consensus || has_indels {
-                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits);
+                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
             }
 
             // When indels were reconstructed, the consensus was rewritten with those indels spliced in:
@@ -700,19 +783,66 @@ pub fn call(args: CallArgs) {
                     None => (output, output_rev, output_counts, output_rev_counts, &viral_metadata, best_genome_index, None),
                 };
 
-            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = call_variants(
-                &args,
-                cur_output,
-                cur_output_counts,
-                cur_output_rev,
-                cur_output_rev_counts,
-                args.min_af,
-                !args.no_end_filter,
-                !args.no_strand_filter,
-                args.n_per_strand,
-                &best_genome_filename,
-                coord_maps_opt, // second pass: translate corrected coords -> original reference
-            );
+            // final variants. With a second pass, the first-pass major SNVs are carried over (they were
+            // baked into the consensus, so the second pass no longer re-finds them), but recomputed against
+            // the second-pass pileup so their depth/AF/strand counts reflect the corrected mapping. The
+            // second pass contributes everything else -- minor variants and anything newly callable -- except
+            // where a first-pass major already reports that position. Without a second pass, the first-pass
+            // call is the final result as-is.
+            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
+                let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
+                    &args,
+                    cur_output,
+                    cur_output_counts,
+                    cur_output_rev,
+                    cur_output_rev_counts,
+                    args.min_af,
+                    !args.no_end_filter,
+                    !args.no_strand_filter,
+                    args.n_per_strand,
+                    &best_genome_filename,
+                    coord_maps_opt, // second pass: translate corrected coords -> original reference
+                );
+
+                let mut merged: Vec<VCFRecord> = Vec::new();
+                let mut major_keys: FxHashSet<(String, usize)> = FxHashSet::default();
+                for r in &first_pass_variants {
+                    if !(r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1) {
+                        continue; // only major SNVs are carried over from the first pass
+                    }
+                    major_keys.insert((r.seq.clone(), r.pos));
+                    let cm = match coord_maps.get(&r.seq) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // a position with no corrected coordinate lies inside a reconstructed indel and is
+                    // subsumed by that indel's record
+                    let corrected = match cm.orig_to_corrected.get(r.pos - 1).copied().flatten() {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // recompute against the second-pass pileup; if it has no coverage there, keep the
+                    // first-pass call
+                    match major_snv_second_pass_record(&r.seq, r.pos, corrected, r.ref_allele[0], r.alt_allele[0], cur_output, cur_output_rev) {
+                        Some(rec) => merged.push(rec),
+                        None => merged.push(r.clone()),
+                    }
+                }
+                // add the second-pass calls except where a first-pass major already reports that position
+                for r in sp_variants {
+                    if !major_keys.contains(&(r.seq.clone(), r.pos)) {
+                        merged.push(r);
+                    }
+                }
+
+                // recount SNVs from the merged set (indel records are added and counted separately below)
+                let num_major_snp = merged.iter().filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+                let num_minor_snp = merged.iter().filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+
+                (merged, num_major_snp, num_minor_snp, sp_breadth, sp_depth)
+            } else {
+                (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth)
+            };
             log_memory_usage(true, "Called variants successfully");
 
             // emit each reconstructed indel as its own VCF record (original-reference coordinates, depth
@@ -1107,6 +1237,7 @@ pub fn print_consensus(
     viral_metadata: &ViralMetadata,
     best_genome_index: &u16,
     reconstructed_indels: &[ReconstructedIndel],
+    major_variants: &[VCFRecord], // first-pass called variants; the major SNVs are applied to the consensus
 ){
     info!("Writing output to pileup");
 
@@ -1120,33 +1251,27 @@ pub fn print_consensus(
 
     let file_meta = &viral_metadata.files[*best_genome_index as usize];
 
-    let bases = [b'A', b'C', b'G', b'T'];
-
     for seq_entry in &file_meta.sequences {
         let seq = &seq_entry.name;
 
         let fwd = output.get(seq).expect("Could not match seq to fwd counts");
         let rev = output_rev.get(seq).expect("Could not match seq to rev counts");
 
-        // build the per-position majority-base consensus (reference coordinates)
+        // start from the reference: keep the reference base where covered, N where there is no coverage
         let mut consensus: Vec<u8> = Vec::with_capacity(fwd.ref_bases.len());
-        for (i, _) in fwd.ref_bases.iter().enumerate() {
-            let row = fwd.counts[i];
-            let row_rev = rev.counts[i];
+        for (i, &ref_base) in fwd.ref_bases.iter().enumerate() {
+            let total_depth: u64 = (0..4).map(|b| fwd.counts[i][b] + rev.counts[i][b]).sum();
+            consensus.push(if total_depth == 0u64 { b'N' } else { ref_base });
+        }
 
-            let row_total: Vec<u64> = (0..4)
-                .map(|b| row[b] + row_rev[b])
-                .collect();
-            let total_depth: u64 = row_total.iter().sum();
-
-            let consensus_base = if total_depth == 0u64 {
-                b'N'
-            } else {
-                let (max_i, _) = row_total.iter().enumerate().max_by_key(|(_, c)| *c).unwrap();
-                bases[max_i]
-            };
-
-            consensus.push(consensus_base);
+        // apply the first-pass called major variants (AF >= 0.5 substitutions) for this sequence, so the
+        // consensus only deviates from the reference at confident, filter-passing calls
+        for v in major_variants {
+            if v.seq == *seq && v.af >= 0.5 && v.ref_allele.len() == 1 && v.alt_allele.len() == 1 {
+                if v.pos >= 1 && v.pos <= consensus.len() {
+                    consensus[v.pos - 1] = v.alt_allele[0];
+                }
+            }
         }
 
         // splice the reconstructed indels for this sequence into the consensus (footprints share the
@@ -1607,6 +1732,52 @@ fn strand_odds_ratio(ref_fwd: u64, ref_rev: u64, alt_fwd: u64, alt_rev: u64) -> 
     let alt_ratio = c.min(d) / c.max(d);
 
     (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln()
+}
+
+// Recompute a first-pass major SNV against the second-pass (corrected consensus) pileup at its corrected
+// position, so the reported depth/AF/strand counts reflect the improved mapping. REF stays the original
+// reference base and ALT the major allele (now the consensus base); the variant is reported at its
+// original-reference position. Returns None if the corrected position has no coverage (the caller then
+// keeps the first-pass call).
+fn major_snv_second_pass_record(
+    seq: &str,
+    orig_pos: usize,    // 1-based original-reference position
+    corrected: usize,   // 0-based position in the corrected-consensus pileup
+    ref_base: u8,       // ASCII original reference base
+    alt_base: u8,       // ASCII major-variant allele (the consensus base)
+    new_output: &DashMap<String, OutputData>,
+    new_output_rev: &DashMap<String, OutputData>,
+) -> Option<VCFRecord> {
+    let fwd = new_output.get(seq)?;
+    let rev = new_output_rev.get(seq)?;
+    if corrected >= fwd.counts.len() {
+        return None;
+    }
+    let total_depth: u64 = (0..4).map(|b| fwd.counts[corrected][b] + rev.counts[corrected][b]).sum();
+    if total_depth == 0 {
+        return None;
+    }
+    let rb = nt_to_bits(ref_base) as usize;
+    let ab = nt_to_bits(alt_base) as usize;
+    let fwd_ref = fwd.counts[corrected][rb];
+    let rev_ref = rev.counts[corrected][rb];
+    let fwd_alt = fwd.counts[corrected][ab];
+    let rev_alt = rev.counts[corrected][ab];
+    let af = (fwd_alt + rev_alt) as f64 / total_depth as f64;
+    let sor = strand_odds_ratio(fwd_ref, rev_ref, fwd_alt, rev_alt);
+    Some(VCFRecord {
+        seq: seq.to_string(),
+        pos: orig_pos,
+        ref_allele: vec![ref_base],
+        alt_allele: vec![alt_base],
+        fwd_ref,
+        rev_ref,
+        fwd_alt,
+        rev_alt,
+        depth: total_depth,
+        af,
+        sor,
+    })
 }
 
 pub fn call_variants(
