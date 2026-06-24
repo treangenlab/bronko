@@ -4,12 +4,106 @@ use crate::lcb::*;
 use log::*;
 use dashmap::DashMap;
 
+// Pull each anchor k-mer this many bases further from the breakpoint, into more confidently-covered
+// reference, since coverage (and base calls) right at the cliff can be unreliable. Shared by internal
+// indel reconstruction and (as the end-anchor margin) by end reconstruction so the geometry matches.
+pub const ANCHOR_MARGIN: usize = 2;
+
+// An anchor k-mer window is only trusted if its total depth stays consistent across the whole window:
+// the smaller depth in the window must be at least this fraction of the larger. Catches gradual depth
+// drift that never trips a single-step breakpoint cliff.
+const ANCHOR_DEPTH_CONSISTENCY: f64 = 0.5;
+
 #[derive(Debug, Clone)]
 pub struct Breakpoint {
     pub pos: usize,      // 1-based position on the low-coverage side of the depth change
     pub direction: i8,   // +1 for a rise in depth, -1 for a drop
     pub depth_high: u64, // larger total depth of the two consecutive positions the change spans
     pub depth_low: u64,  // smaller total depth of the two consecutive positions the change spans
+}
+
+// Per-sequence output of breakpoint detection: the full per-position total depth and every detected
+// breakpoint (not just the paired ones), so the planning step can test candidate anchor windows for
+// depth consistency and for collisions with neighboring variants.
+#[derive(Debug, Clone)]
+pub struct SeqIndelInfo {
+    pub seq: String,
+    pub total: Vec<u64>,                      // total depth (fwd+rev across all bases) per position
+    pub breakpoints: Vec<Breakpoint>,         // all detected breakpoints, in increasing position order
+    pub pairs: Vec<(Breakpoint, Breakpoint)>, // drop -> following-rise pairs (candidate indels)
+}
+
+// Which terminus an end reconstruction rebuilds toward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndSide {
+    Five,  // 5' start: anchor walks left toward position 0
+    Three, // 3' end: anchor walks right toward the terminus
+}
+
+// An explicit end-reconstruction anchor, produced when an indel event sits too close to a terminus to
+// place a clean outer anchor. The breakpoint's clean inner anchor becomes the start of the end walk,
+// replacing the generic first_good/last_good anchor on that side.
+#[derive(Debug, Clone)]
+pub struct EndAnchor {
+    pub seq: String,
+    pub side: EndSide,
+    pub anchor_first_base: usize, // 0-based first base of the anchor k-mer
+}
+
+// 0-based inclusive window [start, end] of the left anchor k-mer for a drop at 1-based `drop_pos`.
+// Mirrors the original geometry in reconstruct_indels: the anchor ends ANCHOR_MARGIN bases before the
+// last confidently-covered base ahead of the drop (the extra -2 converts 1-based to 0-based and steps
+// off the cliff's low-coverage base). None if it would run off the start of the sequence.
+fn left_anchor_window(drop_pos: usize, k: usize) -> Option<(usize, usize)> {
+    let left_end = drop_pos.checked_sub(ANCHOR_MARGIN + 2)?;
+    if left_end + 1 < k {
+        return None;
+    }
+    Some((left_end + 1 - k, left_end))
+}
+
+// 0-based inclusive window [start, end] of the right anchor k-mer for a rise at 1-based `rise_pos`.
+// The anchor starts ANCHOR_MARGIN bases into the confidently-covered region past the rise. None if it
+// would run off the end of the sequence.
+fn right_anchor_window(rise_pos: usize, k: usize, ref_len: usize) -> Option<(usize, usize)> {
+    let start = (rise_pos - 1) + ANCHOR_MARGIN;
+    if start + k > ref_len {
+        return None;
+    }
+    Some((start, start + k - 1))
+}
+
+// Does the depth cliff of the breakpoint at 1-based `pos` fall inside the 0-based inclusive window?
+// A breakpoint with pos = i+1 spans the two consecutive positions total[i-1] -> total[i] (0-based
+// i-1 and i), so treat it as occupying [pos-2, pos-1] and test for interval overlap with the window.
+fn cliff_in_window(pos: usize, window: (usize, usize)) -> bool {
+    let a = pos.saturating_sub(2);
+    let b = pos.saturating_sub(1);
+    a <= window.1 && b >= window.0
+}
+
+// An anchor window is clean if it lies inside the sequence, contains no other breakpoint's cliff, and
+// holds consistent depth (smaller/larger total depth across the window >= ANCHOR_DEPTH_CONSISTENCY).
+fn window_is_clean(window: (usize, usize), total: &[u64], breakpoints: &[Breakpoint]) -> bool {
+    let (s, e) = window;
+    if e >= total.len() || s > e {
+        return false;
+    }
+    for bp in breakpoints {
+        if cliff_in_window(bp.pos, window) {
+            return false;
+        }
+    }
+    let mut lo = u64::MAX;
+    let mut hi = 0u64;
+    for &d in &total[s..=e] {
+        lo = lo.min(d);
+        hi = hi.max(d);
+    }
+    if hi == 0 {
+        return false;
+    }
+    (lo as f64 / hi as f64) >= ANCHOR_DEPTH_CONSISTENCY
 }
 
 // Detection of potential indel breakpoints in the selected genome's pileup, then pairs them into
@@ -26,8 +120,8 @@ pub fn identify_indel_breakpoints(
     min_depth: u64, // this is the minimum depth of the major side of the breakpoint (aka if this is set to 1000, then the major side must have at least 1000 total depth for the breakpoint to be considered, regardless of the depth after drop)
     max_depth: u64, // this is the maximum depth of the minor side of the breakpoint (aka if this is set to 100, then the depth after the drop must be less than 100 for the breakpoint to be considered)
     max_pair_distance: usize, // this is the maximum distance between a drop and the following rise to be paired as an indel
-) -> Vec<(String, Vec<(Breakpoint, Breakpoint)>)> {
-    let mut grouped: Vec<(String, Vec<(Breakpoint, Breakpoint)>)> = Vec::new();
+) -> Vec<SeqIndelInfo> {
+    let mut grouped: Vec<SeqIndelInfo> = Vec::new();
 
     // loop through each sequence pileup for the genome
     for entry in output.iter() {
@@ -75,16 +169,20 @@ pub fn identify_indel_breakpoints(
 
         trace!("{} breakpoints found on sequence {}: {:?}", breakpoints.len(), seq, breakpoints);
 
+        if breakpoints.is_empty() {
+            continue;
+        }
+
         // pair a drop (negative) with the next rise (positive) within max_pair_distance
         let mut seq_pairs: Vec<(Breakpoint, Breakpoint)> = Vec::new();
         let mut pending_drop: Option<Breakpoint> = None;
-        for bp in breakpoints {
+        for bp in &breakpoints {
             match bp.direction {
-                -1 => pending_drop = Some(bp), // most recent drop opens a potential indel
+                -1 => pending_drop = Some(bp.clone()), // most recent drop opens a potential indel
                 1 => {
                     if let Some(drop) = pending_drop.take() {
                         if bp.pos.saturating_sub(drop.pos) <= max_pair_distance {
-                            seq_pairs.push((drop, bp));
+                            seq_pairs.push((drop, bp.clone()));
                         }
                     }
                 }
@@ -92,15 +190,130 @@ pub fn identify_indel_breakpoints(
             }
         }
 
-        if !seq_pairs.is_empty() {
-            grouped.push((seq.clone(), seq_pairs));
-        }
+        grouped.push(SeqIndelInfo {
+            seq: seq.clone(),
+            total,
+            breakpoints,
+            pairs: seq_pairs,
+        });
     }
 
     grouped
 }
 
+// Turn the detected breakpoint pairs into a concrete reconstruction plan, enforcing that every anchor
+// k-mer sits over a true, consistently-covered region:
+//   - Merge pass: neighboring indel pairs whose outer anchor windows would collide (overlap each other
+//     or straddle the other's breakpoint) are combined into a single event spanning [first drop, last
+//     rise]. The inner breakpoints are absorbed into the bridge, so only the outer anchors matter.
+//   - Classify: for each merged event, if an outer anchor can't be placed in clean, confidently-covered
+//     reference because the event is too close to a terminus, the event is handed off to end
+//     reconstruction (an EndAnchor) starting from its clean inner anchor and walking to the terminus,
+//     rather than attempting an internal bridge. Events with clean anchors on both sides are emitted as
+//     internal pairs; events left unclean by a stray (un-mergeable) breakpoint or depth wobble are dropped.
+// Returns (internal pairs grouped by sequence, end anchors) for reconstruct_indels / reconstruct_ends.
+pub fn plan_indel_events(
+    infos: &[SeqIndelInfo],
+    k: usize,
+    min_depth: u64,
+) -> (Vec<(String, Vec<(Breakpoint, Breakpoint)>)>, Vec<EndAnchor>) {
+    let mut internal: Vec<(String, Vec<(Breakpoint, Breakpoint)>)> = Vec::new();
+    let mut ends: Vec<EndAnchor> = Vec::new();
 
+    for info in infos {
+        let total = &info.total;
+        let ref_len = total.len();
+        let bps = &info.breakpoints;
+
+        // ---- merge pass: collapse neighboring pairs whose anchor windows collide ----
+        // merges only ever extend a pair's rise rightward, so a single left-to-right accumulation chains
+        // any run of mutually-colliding pairs into one event.
+        let mut merged: Vec<(Breakpoint, Breakpoint)> = Vec::new();
+        for (drop, rise) in &info.pairs {
+            // copy the prev rise position out so the immutable borrow of `merged` is released before the
+            // mutable borrow below
+            let mut collide = false;
+            if let Some((_, prev_rise)) = merged.last() {
+                let prev_rise_pos = prev_rise.pos;
+                let rw = right_anchor_window(prev_rise_pos, k, ref_len);
+                let lw = left_anchor_window(drop.pos, k);
+                collide = match (rw, lw) {
+                    (Some(rw), Some(lw)) => {
+                        let overlap = rw.0 <= lw.1 && lw.0 <= rw.1;
+                        overlap
+                            || cliff_in_window(drop.pos, rw)    // this pair's drop sits in prev's right anchor
+                            || cliff_in_window(prev_rise_pos, lw) // prev's rise sits in this pair's left anchor
+                    }
+                    // a missing window means no room for a clean anchor between them -> merge
+                    _ => true,
+                };
+            }
+            if collide {
+                merged.last_mut().unwrap().1 = rise.clone();
+            } else {
+                merged.push((drop.clone(), rise.clone()));
+            }
+        }
+
+        // ---- classify each merged event: internal bridge vs. end handoff ----
+        let first_good = total.iter().position(|&d| d >= min_depth);
+        let last_good = total.iter().rposition(|&d| d >= min_depth);
+
+        let mut seq_internal: Vec<(Breakpoint, Breakpoint)> = Vec::new();
+        for (drop, rise) in merged {
+            let lw = left_anchor_window(drop.pos, k);
+            let rw = right_anchor_window(rise.pos, k, ref_len);
+
+            // an outer anchor that runs off the sequence, or dips out of the confidently-covered region,
+            // means this side reaches a terminus: hand off to end reconstruction from the opposite (clean)
+            // inner anchor instead of bridging.
+            let near_five = match lw {
+                None => true,
+                Some((s, _)) => first_good.map_or(true, |fg| s < fg),
+            };
+            let near_three = match rw {
+                None => true,
+                Some((_, e)) => last_good.map_or(true, |lg| e > lg),
+            };
+
+            if near_five {
+                // rebuild the 5' end: anchor at the event's clean right anchor, walk left to the terminus
+                if let Some((s, _)) = rw {
+                    if window_is_clean((s, s + k - 1), total, bps) {
+                        ends.push(EndAnchor { seq: info.seq.clone(), side: EndSide::Five, anchor_first_base: s });
+                    }
+                }
+            }
+            if near_three {
+                // rebuild the 3' end: anchor at the event's clean left anchor, walk right to the terminus
+                if let Some((s, e)) = lw {
+                    if window_is_clean((s, e), total, bps) {
+                        ends.push(EndAnchor { seq: info.seq.clone(), side: EndSide::Three, anchor_first_base: s });
+                    }
+                }
+            }
+            if near_five || near_three {
+                continue; // handled as an end (or un-anchorable); never bridged
+            }
+
+            // internal event: both outer anchors must be clean reference, else drop it
+            match (lw, rw) {
+                (Some(lw), Some(rw))
+                    if window_is_clean(lw, total, bps) && window_is_clean(rw, total, bps) =>
+                {
+                    seq_internal.push((drop, rise));
+                }
+                _ => {}
+            }
+        }
+
+        if !seq_internal.is_empty() {
+            internal.push((info.seq.clone(), seq_internal));
+        }
+    }
+
+    (internal, ends)
+}
 
 #[derive(Debug, Clone)]
 pub struct ReconstructedIndel {
@@ -176,7 +389,7 @@ fn reconstruct_indel(
     k: usize,
     flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
 ) -> Option<Vec<u8>> {
-    const MAX_BRIDGE: usize = 20; // largest novel (inserted) span we attempt to bridge
+    const MAX_BRIDGE: usize = 50; // largest novel (inserted) span we attempt to bridge
     const DEPTH_LO: f64 = 0.5;
     const DEPTH_HI: f64 = 2.0;
 
@@ -266,16 +479,14 @@ fn reconstruct_indel(
 
 // General function for reconstructing indels -- does so for each breakpoint pair identified. The reference sequence is looked up by name from
 // the chosen genome's output table (carried once per group), so nothing extra needs to be passed in.
+// `grouped_pairs` are the merged, anchor-validated internal events from plan_indel_events, so the anchor
+// windows are already known to sit over clean reference; the geometry helpers re-derive them here.
 pub fn reconstruct_indels(
     output: &DashMap<String, OutputData>,
     flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
     grouped_pairs: &[(String, Vec<(Breakpoint, Breakpoint)>)],
     k: usize,
 ) -> Vec<ReconstructedIndel> {
-    // pull each anchor k-mer this many bases further from the breakpoint, into more confidently-covered
-    // reference, since coverage (and base calls) right at the cliff can be unreliable
-    const ANCHOR_MARGIN: usize = 2;
-
     let mut results: Vec<ReconstructedIndel> = Vec::new();
 
     for (seq, pairs) in grouped_pairs {
@@ -295,19 +506,14 @@ pub fn reconstruct_indels(
                 rise.pos,
                 seq
             );
-            let left_end = match drop.pos.checked_sub(ANCHOR_MARGIN+2) { // -2 because -1 for from 1-based to 0-based, -1 because based off second nucleotide
-                Some(v) => v, // 0-based, last base of the left anchor k-mer
+            let (left_start, left_end) = match left_anchor_window(drop.pos, k) {
+                Some(w) => w,
                 None => continue,
             };
-            if left_end + 1 < k {
-                continue;
-            }
-            let left_start = left_end + 1 - k; // 0-based, first base of the left anchor k-mer
-            let right_start = rise.pos - 1 + ANCHOR_MARGIN; // 0-based, first base of the right anchor k-mer
-            if right_start + k > ref_bases.len() {
-                continue;
-            }
-            let right_end = right_start + k - 1; // 0-based, last base of the right anchor k-mer
+            let (right_start, right_end) = match right_anchor_window(rise.pos, k, ref_bases.len()) {
+                Some(w) => w,
+                None => continue,
+            };
 
             let left_kmer = &ref_bases[left_start..=left_end];
             let right_kmer = &ref_bases[right_start..=right_end];
@@ -414,14 +620,19 @@ fn reconstruct_end(
 // we re-map to: the caller does not report or count it as a variant. Because it is length-preserving it
 // leaves coordinates unchanged for everything else. Any terminal bases the walk could not reach are left
 // untouched, so they remain as the consensus produces them -- N where there is no coverage.
+// `end_anchors` lets the indel planner override where an end walk begins: when an indel sits too close to
+// a terminus to bridge, its clean inner anchor is supplied here and used instead of the generic
+// first_good/last_good anchor for that (sequence, side). Sides without an override fall back to the generic
+// behavior.
 pub fn reconstruct_ends(
     output: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
     flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
     k: usize,
     min_depth: u64,
+    end_anchors: &[EndAnchor],
 ) -> Vec<ReconstructedIndel> {
-    const END_ANCHOR_MARGIN: usize = 2; // pull the anchor this far inside the confidently-covered region
+    const END_ANCHOR_MARGIN: usize = ANCHOR_MARGIN; // pull the anchor this far inside the confidently-covered region
 
     let mut results: Vec<ReconstructedIndel> = Vec::new();
 
@@ -446,56 +657,73 @@ pub fn reconstruct_ends(
         let first_good = total.iter().position(|&d| d >= min_depth);
         let last_good = total.iter().rposition(|&d| d >= min_depth);
 
-        // ---- 5' start: anchor just inside the first covered position, walk left toward position 0 ----
-        if let Some(fg) = first_good {
-            if fg > 0 {
-                let anchor_start = fg + END_ANCHOR_MARGIN; // 0-based first base of the anchor k-mer
-                let anchor_end = anchor_start + k - 1;      // 0-based last base
-                if anchor_end < len {
-                    let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
-                    // walk left at most `anchor_start` bases (reaching position 0 = the reference start)
-                    let head = reconstruct_end(anchor_kmer, false, anchor_start, k, flanking_base_map);
-                    if !head.is_empty() {
-                        // footprint exactly spans the rebuilt region [anchor_start - head.len(), anchor_end]
-                        let ref_start = anchor_start - head.len() + 1; // 1-based
-                        let mut allele = head;
-                        allele.extend_from_slice(anchor_kmer);
-                        results.push(ReconstructedIndel {
-                            seq: seq.clone(),
-                            drop_pos: 1,
-                            rise_pos: fg + 1,
-                            ref_start,
-                            ref_end: anchor_end + 1,
-                            allele,
-                        });
-                    }
+        // breakpoint-derived anchor overrides for this sequence, if the planner handed any off
+        let override_five = end_anchors.iter()
+            .find(|e| e.seq == *seq && e.side == EndSide::Five)
+            .map(|e| e.anchor_first_base);
+        let override_three = end_anchors.iter()
+            .find(|e| e.seq == *seq && e.side == EndSide::Three)
+            .map(|e| e.anchor_first_base);
+
+        // ---- 5' start: anchor just inside the first covered position (or at the override), walk left ----
+        // 0-based first base of the anchor k-mer: the planner's override wins, else the generic first_good anchor
+        let anchor_start_5 = override_five.or_else(|| {
+            first_good.and_then(|fg| (fg > 0).then(|| fg + END_ANCHOR_MARGIN))
+        });
+        if let Some(anchor_start) = anchor_start_5 {
+            let anchor_end = anchor_start + k - 1; // 0-based last base
+            if anchor_end < len {
+                let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
+                // walk left at most `anchor_start` bases (reaching position 0 = the reference start)
+                let head = reconstruct_end(anchor_kmer, false, anchor_start, k, flanking_base_map);
+                if !head.is_empty() {
+                    // footprint exactly spans the rebuilt region [anchor_start - head.len(), anchor_end]
+                    let ref_start = anchor_start - head.len() + 1; // 1-based
+                    let mut allele = head;
+                    allele.extend_from_slice(anchor_kmer);
+                    results.push(ReconstructedIndel {
+                        seq: seq.clone(),
+                        drop_pos: 1,
+                        rise_pos: anchor_start + 1,
+                        ref_start,
+                        ref_end: anchor_end + 1,
+                        allele,
+                    });
                 }
             }
         }
 
-        // ---- 3' end: anchor just inside the last covered position, walk right toward the terminus ----
-        if let Some(lg) = last_good {
-            if lg + 1 < len && lg >= END_ANCHOR_MARGIN {
-                let anchor_end = lg - END_ANCHOR_MARGIN; // 0-based last base of the anchor k-mer
-                if anchor_end + 1 >= k {
-                    let anchor_start = anchor_end + 1 - k; // 0-based first base
-                    let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
-                    let max_ext = (len - 1) - anchor_end; // reach the last reference position at most
-                    let tail = reconstruct_end(anchor_kmer, true, max_ext, k, flanking_base_map);
-                    if !tail.is_empty() {
-                        // footprint exactly spans the rebuilt region [anchor_start, anchor_end + tail.len()]
-                        let ref_end = anchor_end + tail.len() + 1; // 1-based
-                        let mut allele = anchor_kmer.to_vec();
-                        allele.extend_from_slice(&tail);
-                        results.push(ReconstructedIndel {
-                            seq: seq.clone(),
-                            drop_pos: lg + 1,
-                            rise_pos: len,
-                            ref_start: anchor_start + 1,
-                            ref_end,
-                            allele,
-                        });
-                    }
+        // ---- 3' end: anchor just inside the last covered position (or at the override), walk right ----
+        // 0-based first base of the anchor k-mer: the planner's override wins, else the generic last_good anchor
+        let anchor_start_3 = override_three.or_else(|| {
+            last_good.and_then(|lg| {
+                if lg + 1 < len && lg >= END_ANCHOR_MARGIN {
+                    let anchor_end = lg - END_ANCHOR_MARGIN;
+                    (anchor_end + 1 >= k).then(|| anchor_end + 1 - k)
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(anchor_start) = anchor_start_3 {
+            let anchor_end = anchor_start + k - 1; // 0-based last base
+            if anchor_end < len {
+                let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
+                let max_ext = (len - 1) - anchor_end; // reach the last reference position at most
+                let tail = reconstruct_end(anchor_kmer, true, max_ext, k, flanking_base_map);
+                if !tail.is_empty() {
+                    // footprint exactly spans the rebuilt region [anchor_start, anchor_end + tail.len()]
+                    let ref_end = anchor_end + tail.len() + 1; // 1-based
+                    let mut allele = anchor_kmer.to_vec();
+                    allele.extend_from_slice(&tail);
+                    results.push(ReconstructedIndel {
+                        seq: seq.clone(),
+                        drop_pos: anchor_end + 1,
+                        rise_pos: len,
+                        ref_start: anchor_start + 1,
+                        ref_end,
+                        allele,
+                    });
                 }
             }
         }

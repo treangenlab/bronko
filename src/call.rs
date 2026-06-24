@@ -391,12 +391,15 @@ pub fn call(args: CallArgs) {
                 info!("Indel reconstruction disabled (--no-indels)");
                 (Vec::new(), Vec::new())
             } else {
-                let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
-                let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
-                info!("Identified {} potential indel breakpoint pairs across {} sequences", n_pairs, breakpoint_pairs.len());
-                trace!("Indel breakpoint pairs: {:?}", breakpoint_pairs);
+                let infos = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
+                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64);
+                let n_breakpoints: usize = infos.iter().map(|i| i.breakpoints.len()).sum();
+                let n_pairs: usize = merged_pairs.iter().map(|(_, p)| p.len()).sum();
+                info!("Identified {} breakpoints across {} sequences; planned {} internal indel event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
+                trace!("Planned internal indel pairs: {:?}", merged_pairs);
+                trace!("Planned end anchors: {:?}", end_anchors);
 
-                let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &breakpoint_pairs, args.kmer);
+                let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &merged_pairs, args.kmer);
                 info!("Reconstructed {} indel alleles", reconstructed_indels.len());
                 for indel in &reconstructed_indels {
                     info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
@@ -404,7 +407,7 @@ pub fn call(args: CallArgs) {
 
                 // generalize reconstruction to the sequence ends, for the consensus only (capped at the
                 // reference length; bases the walk can't reach stay as the consensus's N)
-                let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64);
+                let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
                 info!("Reconstructed {} sequence end(s) for the consensus", reconstructed_ends.len());
                 for end in &reconstructed_ends {
                     info!("  end {} (ref {}-{}) allele: {}", end.seq, end.ref_start, end.ref_end, String::from_utf8_lossy(&end.allele));
@@ -674,12 +677,15 @@ pub fn call(args: CallArgs) {
                 info!("Indel reconstruction disabled (--no-indels)");
                 (Vec::new(), Vec::new())
             } else {
-                let breakpoint_pairs = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
-                let n_pairs: usize = breakpoint_pairs.iter().map(|(_, p)| p.len()).sum();
-                info!("Identified {} potential indel breakpoint pairs across {} sequences", n_pairs, breakpoint_pairs.len());
-                trace!("Indel breakpoint pairs: {:?}", breakpoint_pairs);
+                let infos = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
+                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64);
+                let n_breakpoints: usize = infos.iter().map(|i| i.breakpoints.len()).sum();
+                let n_pairs: usize = merged_pairs.iter().map(|(_, p)| p.len()).sum();
+                info!("Identified {} breakpoints across {} sequences; planned {} internal indel event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
+                trace!("Planned internal indel pairs: {:?}", merged_pairs);
+                trace!("Planned end anchors: {:?}", end_anchors);
 
-                let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &breakpoint_pairs, args.kmer);
+                let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &merged_pairs, args.kmer);
                 info!("Reconstructed {} indel alleles", reconstructed_indels.len());
                 for indel in &reconstructed_indels {
                     info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
@@ -687,7 +693,7 @@ pub fn call(args: CallArgs) {
 
                 // generalize reconstruction to the sequence ends, for the consensus only (capped at the
                 // reference length; bases the walk can't reach stay as the consensus's N)
-                let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64);
+                let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
                 info!("Reconstructed {} sequence end(s) for the consensus", reconstructed_ends.len());
                 for end in &reconstructed_ends {
                     info!("  end {} (ref {}-{}) allele: {}", end.seq, end.ref_start, end.ref_end, String::from_utf8_lossy(&end.allele));
