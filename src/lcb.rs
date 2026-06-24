@@ -74,15 +74,14 @@ pub fn kmer_to_u64(kmer: &[u8]) -> u64 {
 }
 
 pub fn reverse_complement_u64(kmer_val: u64, k: usize) -> u64 {
-    let mut rc = 0u64;
-    for i in 0..k {
-        let two_bits = (kmer_val >> (2 * i)) & 0b11;
-        let comp = 0b11 ^ two_bits; // complement
-        rc <<= 2;
-        rc |= comp;
-    }
-    rc
+    //reverse bits in place in 3 iterations rather than iterating k times. 
+    assert!(k <= 32, "Ksize must be less than 32"); //for u64 memory. to increase k, consider using u128
+    let rev = kmer_val.reverse_bits() >> (64 - 2 * k);
+    let rev_fixed = ((rev >> 1) & 0x5555_5555_5555_5555u64)
+        | ((rev & 0x5555_5555_5555_5555u64) << 1);
+    rev_fixed ^ ((1u64 << (2 * k)).wrapping_sub(1))
 }
+
 
 pub fn canonical_kmer(kmer: &[u8], k: usize) -> (u64, bool) {
     let fwd = kmer_to_u64(kmer);
