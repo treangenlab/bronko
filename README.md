@@ -21,8 +21,9 @@ bronko also allows users to run multiple samples of the same species and build a
 3. **Consistently ultrafast** -- bronko is between 10-1000x faster than existing pipelines for read mapping (bowtie2, ie) and then variant calling (lofreq, ivar, ie), depending on the sequencing depth / number of reads as well as the number of threads available
 4. **Comparable precision and sensitivity** -- On our benchmarks so far, bronko achieves reasonable consistency with both ivar and lofreq on variant calling for both SNPs and iSNVs, even outperforming in some cases.
 
-### Why not to use bronko
-1. If you are interested in identifying novel indels in viral genomes, currently we do not report on indel presence, but we are working on this problem. For historical sequencing data, we attempt to bypass this problem by letting you incorporate multiple reference genomes into a database and then we will automatically select the one with highest identity to each sample.
+> [!IMPORTANT]
+> New feature in v0.1.4: bronko can now call indels! Please note that this aspect of the software is still in early stages (please let me know if you find any bugs).
+> Additional documentation is available in the wiki.  
 
 ### How does bronko work
 bronko bypasses readmapping by directly mapping kmers with small edit distance to a pileup representing the forward and reverse strands. It then uses the depth information and number of kmers mapping to each position/base to perform variant calling, similarly to existing tools. The lack of a formal pileup makes the process much more efficient, and thus we are able to achieve similar results in a fraction of the time.  
