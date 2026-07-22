@@ -141,6 +141,27 @@ pub struct CallArgs {
     #[clap(long="noise-multiplier", default_value_t = DEFAULT_NOISE_MULTIPLIER, help_heading = "VARIANT CALLING PARAMETERS", help="How much greater (1x, 1.5x, etc) the minor allele frequency of a variant must be above estimated baseline noise in that region (must be > 1.0x). Note that for variants under 1%, multiplier will be increased exponentially up to +0.5 more")]
     pub variant_multiplier: f64,
 
+    //INDEL PARAMETERS
+    //disable indel reconstruction entirely (consensus will not contain indels)
+    #[clap(long="no-indels", default_value_t = DEFAULT_NO_INDELS, help_heading="INDEL DETECTION", help="Disable indel detection and reconstruction (the consensus sequence will not contain indels)")]
+    pub no_indels: bool,
+
+    //max ratio of low/high total depth between neighbors to flag a breakpoint
+    #[clap(long="indel-max-ratio", default_value_t = DEFAULT_INDEL_MAX_RATIO, help_heading="INDEL DETECTION", help="Flag an indel breakpoint when min/max total depth between two neighboring positions falls below this ratio (a sharp coverage cliff)")]
+    pub indel_max_ratio: f64,
+
+    //min total depth at a position to consider a breakpoint
+    #[clap(long="indel-min-depth", default_value_t = DEFAULT_INDEL_MIN_DEPTH, help_heading="INDEL DETECTION", help="Minimum total depth to identify breakpoints for indel detection")]
+    pub indel_min_depth: usize,
+
+    //max total depth after a coverage drop to consider a breakpoint
+    #[clap(long="indel-max-drop-depth", default_value_t = DEFAULT_INDEL_MAX_DROP_DEPTH, help_heading="INDEL DETECTION", help="Maximum total depth to be considered an indel breakpoint (the low side of a coverage cliff must be under this)")]
+    pub indel_max_drop_depth: usize,
+
+    #[clap(long="indel-width", default_value_t = DEFAULT_INDEL_WIDTH, help_heading="INDEL DETECTION", help="Maximum distance between a coverage drop and the following rise to be paired as an indel for reconstruction")]
+    pub indel_width: usize,
+
+
     //OUTPUT PARAMETERS
     //todo add output locations, output formats
     #[clap(short, long="output", help_heading="OUTPUT", default_value = DEFAULT_OUT_FOLDER, help="Folder to output all resulting files")]

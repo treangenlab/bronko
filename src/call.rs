@@ -2,13 +2,14 @@ use crate::cli::*;
 use crate::lcb::*;
 use crate::util::*;
 use crate::build::*;
+use crate::indels::*;
+use crate::consts::*;
 
 use anyhow::{Result};
 
 use num_cpus;
 use log::*;
-use crate::consts::*;
-use rustc_hash::{FxHashMap};
+use rustc_hash::{FxHashMap, FxHashSet};
 use dashmap::DashMap;
 use bincode::{config};
 
@@ -153,8 +154,10 @@ fn check_args(args: &CallArgs) {
 pub struct OutputInfo {
     filename: String,
     selected_genome: String,
-    num_major_variants: usize,
-    num_minor_variants: usize,
+    num_major_snp: usize,
+    num_minor_snp: usize,
+    num_insertions: usize,
+    num_deletions: usize,
     breadth_coverage: f64,
     depth_coverage: f64,
     num_perfect_kmers: usize,
@@ -278,7 +281,7 @@ pub fn call(args: CallArgs) {
         error!("No sequencing datasets provided using -r or -1/-2 or --file-input, exiting");
         std::process::exit(1);
     } else {
-        info!("Read in {} sequencing datasets ({} single end, {} paired end)", n_pe_seq_datasets + n_se_seq_datasets, n_pe_seq_datasets, n_se_seq_datasets);
+        info!("Read in {} sequencing datasets ({} single end, {} paired end)", n_pe_seq_datasets + n_se_seq_datasets, n_se_seq_datasets, n_pe_seq_datasets);
     }
 
     // create output directory
@@ -349,7 +352,9 @@ pub fn call(args: CallArgs) {
             info!("Initializing mapping arrays");
             let output_maps = initialize_output_maps(&viral_metadata);
             info!("Mapping kmers to all genomes");
-            let mapping_data = map_kmers(&kmers, &ref_index, &viral_metadata, &args.threads, &args, &output_maps);
+            let flanking_base_map: DashMap<u64, [[u64; 4]; 2]> = DashMap::new();
+            let mapping_data = map_kmers(&kmers, &ref_index, &viral_metadata, &args.threads, &args, &output_maps, &flanking_base_map);
+            trace!("Collected flanking base counts for {} buckets", flanking_base_map.len());
 
             //select the best genome from the mapping data
             info!("Selecting the most representative genome");
@@ -374,13 +379,13 @@ pub fn call(args: CallArgs) {
             }
 
             
-            // call variants and print them out to vcf
+            // first pass to call variants
             let (output, output_rev, output_counts, output_rev_counts)= output_maps.get(&best_genome_index).unwrap_or_else(|| {
                 error!("Failed to find mapping data for selected genome");
                 std::process::exit(1);
             });
 
-            let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
+            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
                 &args,
                 output,
                 output_counts,
@@ -390,32 +395,210 @@ pub fn call(args: CallArgs) {
                 !args.no_end_filter,
                 !args.no_strand_filter,
                 args.n_per_strand,
-                &best_genome_filename
+                &best_genome_filename,
+                None, // first pass: original-reference coordinates
             );
+
+
+            // reconstruct indels and sequence ends unless disabled
+            let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
+                info!("Indel reconstruction disabled (--no-indels)");
+                (Vec::new(), Vec::new())
+            } else {
+                let infos = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
+                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64);
+                let n_breakpoints: usize = infos.iter().map(|i| i.breakpoints.len()).sum();
+                let n_pairs: usize = merged_pairs.iter().map(|(_, p)| p.len()).sum();
+                info!("Identified {} breakpoints across {} sequences; planned {} internal indel event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
+                trace!("Planned internal indel pairs: {:?}", merged_pairs);
+                trace!("Planned end anchors: {:?}", end_anchors);
+
+                let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &merged_pairs, args.kmer);
+                info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+                for indel in &reconstructed_indels {
+                    info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
+                }
+
+                let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
+                info!("Reconstructed {} sequence end(s) for the consensus", reconstructed_ends.len());
+                for end in &reconstructed_ends {
+                    info!("  end {} (ref {}-{}) allele: {}", end.seq, end.ref_start, end.ref_end, String::from_utf8_lossy(&end.allele));
+                }
+
+                (reconstructed_indels, reconstructed_ends)
+            };
+
+            // rebuild a consensus from the indels and ends
+            let consensus_edits: Vec<ReconstructedIndel> = reconstructed_indels
+                .iter()
+                .cloned()
+                .chain(reconstructed_ends.iter().filter(|end| {
+                    !reconstructed_indels.iter().any(|ind| ind.seq == end.seq
+                        && end.ref_start <= ind.ref_end && ind.ref_start <= end.ref_end)
+                }).cloned())
+                .collect();
+
+            let has_indels = !consensus_edits.is_empty();
+
+            if !has_indels {
+                info!("No indels or sequence ends were reconstructed, skipping second pass of mapping");
+            } else {
+                info!("Printing reconstructed consensus sequence for sample {} ({} indel/ends)", clean_sample_id(se_read), consensus_edits.len());
+            }
+
+            // print the sample consensus so we can use it for the second pass (if anything was reconstructed)
+            if args.output_consensus || has_indels {
+                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
+            }
+
+            // Second pass of mapping if reconstructed
+            let second_pass = if has_indels {
+                let consensus_path = format!("{}/{}.fa", args.output, clean_sample_id(se_read));
+                let (new_index, new_meta) = build_indexes(args.kmer, &[consensus_path]).unwrap_or_else(|e| {
+                    error!("{} | Failed to build index from corrected consensus", e);
+                    std::process::exit(1);
+                });
+                info!("Built corrected index from consensus: {} buckets, {} sequence(s)", new_index.len(), new_meta.files.iter().map(|f| f.sequences.len()).sum::<usize>());
+
+                // flanking base counts aren't needed here, so the pass-1 map is reused as a throwaway sink.
+                let new_output_maps = initialize_output_maps(&new_meta);
+                let new_mapping_data = map_kmers(&kmers, &new_index, &new_meta, &args.threads, &args, &new_output_maps, &flanking_base_map);
+                let (new_perfect, new_variant, _) = new_mapping_data.get(&0).copied().unwrap_or((0, 0, 0));
+                info!("Re-mapped kmers onto corrected consensus: {}/{} perfect, {} variant", new_perfect, unique_counted_kmer, new_variant);
+
+                // map each corrected coordinate back to the original reference (positions inside a spliced
+                // indel allele have no original coordinate and are skipped during calling)
+                let mut coord_maps: FxHashMap<String, CoordMap> = FxHashMap::default();
+                for entry in output.iter() {
+                    let seq = entry.key();
+                    let ref_len = entry.value().ref_bases.len();
+                    coord_maps.insert(seq.clone(), build_coord_map(ref_len, seq, &reconstructed_indels));
+                }
+
+                Some((new_meta, new_output_maps, coord_maps, (new_perfect, new_variant)))
+            } else {
+                None
+            };
+
+            // pick the pileup source + metadata all output runs against: the corrected second pass when
+            // present, otherwise the selected genome's first-pass pileup
+            let (cur_output, cur_output_rev, cur_output_counts, cur_output_rev_counts, cur_meta, cur_genome_index, coord_maps_opt) =
+                match &second_pass {
+                    Some((new_meta, new_output_maps, coord_maps, _)) => {
+                        let (o, orv, oc, orc) = new_output_maps.get(&0).unwrap_or_else(|| {
+                            error!("Failed to find mapping data for corrected consensus");
+                            std::process::exit(1);
+                        });
+                        (o, orv, oc, orc, new_meta, 0u16, Some(coord_maps))
+                    }
+                    None => (output, output_rev, output_counts, output_rev_counts, &viral_metadata, best_genome_index, None),
+                };
+
+            // Print the final variants. First-pass major SNVs are always carried over. If there was a second pass, the
+            // the minor variants and any indels or new SNVs are also carried over and translated position-wise. Without a second pass, the first-pass
+            // call is the final result as-is.
+            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
+                let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
+                    &args,
+                    cur_output,
+                    cur_output_counts,
+                    cur_output_rev,
+                    cur_output_rev_counts,
+                    args.min_af,
+                    !args.no_end_filter,
+                    !args.no_strand_filter,
+                    args.n_per_strand,
+                    &best_genome_filename,
+                    coord_maps_opt, // second pass: translate corrected coords -> original reference
+                );
+
+                let mut merged: Vec<VCFRecord> = Vec::new();
+                let mut major_keys: FxHashSet<(String, usize)> = FxHashSet::default();
+                for r in &first_pass_variants {
+                    if !(r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1) {
+                        continue; // only major SNVs are carried over from the first pass
+                    }
+                    major_keys.insert((r.seq.clone(), r.pos));
+                    let cm = match coord_maps.get(&r.seq) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // a position with no corrected coordinate lies inside a reconstructed indel and is
+                    // subsumed by that indel's record
+                    let corrected = match cm.orig_to_corrected.get(r.pos - 1).copied().flatten() {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // recompute against the second-pass pileup; if it has no coverage there, keep the
+                    // first-pass call
+                    match major_snv_second_pass_record(&r.seq, r.pos, corrected, r.ref_allele[0], r.alt_allele[0], cur_output, cur_output_rev) {
+                        Some(rec) => merged.push(rec),
+                        None => merged.push(r.clone()),
+                    }
+                }
+                // add the second-pass calls except where a first-pass major already reports that position
+                for r in sp_variants {
+                    if !major_keys.contains(&(r.seq.clone(), r.pos)) {
+                        merged.push(r);
+                    }
+                }
+
+                // recount SNVs from the merged set (indel records are added and counted separately below)
+                let num_major_snp = merged.iter().filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+                let num_minor_snp = merged.iter().filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+
+                (merged, num_major_snp, num_minor_snp, sp_breadth, sp_depth)
+            } else {
+                (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth)
+            };
             log_memory_usage(true, "Called variants successfully");
+
+            // emit each reconstructed indel as its own VCF record (original-reference coordinates, depth
+            // pulled from the corrected-consensus pileup), tallying insertions and deletions separately
+            let mut num_insertions = 0;
+            let mut num_deletions = 0;
+            if let Some(coord_maps) = coord_maps_opt {
+                for indel in &reconstructed_indels {
+                    if let Some(coord_map) = coord_maps.get(&indel.seq) {
+                        if let Some(rec) = indel_to_vcf_record(indel, output, output_rev, cur_output, cur_output_rev, coord_map) {
+                            match rec.var_type() {
+                                "INS" => num_insertions += 1,
+                                "DEL" => num_deletions += 1,
+                                _ => {}
+                            }
+                            variants.push(rec);
+                        }
+                    }
+                }
+            }
 
             //print outputs
             if args.output_pileup {
-                print_pileup(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index);
+                print_pileup(&se_read, &args, cur_output, cur_output_rev, cur_meta, &cur_genome_index, second_pass.is_some());
             }
 
-            //print consensus
-            if args.output_consensus{
-                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index);
-            }
-
+            // VCF reports in original-reference coordinates regardless of pass
             print_output(&se_read, &args, &variants, &viral_metadata, &best_genome_index);
+
+            // kmer mapping statistics: use the corrected second pass when indels were applied, else the
+            // first pass against the selected genome
+            let (out_perfect_kmers, out_variant_kmers, out_unmapped_kmers) = match &second_pass {
+                Some((.., (p, v))) => (*p, *v, unique_counted_kmer.saturating_sub(*p + *v)),
+                None => (*n_perfect_mapped, *n_variant_mapped, n_unmapped_kmers),
+            };
 
             output_info.push(OutputInfo {
                 filename: se_read.to_string(),
                 selected_genome: best_genome_filename.to_string(),
-                num_major_variants: num_major_variants,
-                num_minor_variants: num_minor_variants,
+                num_major_snp: num_major_snp,
+                num_minor_snp: num_minor_snp,
+                num_insertions: num_insertions,
+                num_deletions: num_deletions,
                 breadth_coverage: breadth_cov,
                 depth_coverage: depth_cov,
-                num_perfect_kmers: *n_perfect_mapped,
-                num_variant_kmers: *n_variant_mapped,
-                num_unmapped_kmers: n_unmapped_kmers,
+                num_perfect_kmers: out_perfect_kmers,
+                num_variant_kmers: out_variant_kmers,
+                num_unmapped_kmers: out_unmapped_kmers,
             });
             variant_info.push((se_read.to_string(), variants));
 
@@ -444,8 +627,10 @@ pub fn call(args: CallArgs) {
             info!("Initializing mapping arrays");
             let output_maps = initialize_output_maps(&viral_metadata);
             info!("Mapping kmers to all genomes");
-            let mapping_data_r1 = map_kmers(&kmers1, &ref_index, &viral_metadata, &half_threads, &args, &output_maps);
-            let mapping_data_r2 = map_kmers(&kmers2, &ref_index, &viral_metadata, &half_threads, &args, &output_maps);
+            let flanking_base_map: DashMap<u64, [[u64; 4]; 2]> = DashMap::new();
+            let mapping_data_r1 = map_kmers(&kmers1, &ref_index, &viral_metadata, &half_threads, &args, &output_maps, &flanking_base_map);
+            let mapping_data_r2 = map_kmers(&kmers2, &ref_index, &viral_metadata, &half_threads, &args, &output_maps, &flanking_base_map);
+            trace!("Collected flanking base counts for {} buckets", flanking_base_map.len());
 
             info!("Selecting the most representative genome");
             let best_genome_index = pick_best_genome_paired(&mapping_data_r1, &mapping_data_r2, &viral_metadata).unwrap_or_else(|| {
@@ -471,13 +656,13 @@ pub fn call(args: CallArgs) {
                 warn!("Percent of kmers found is very low, suggesting a bad reference, a bad sequencing run, contamination in sample, or some other issue")
             }
 
-            // call variants and print them out
+            // call variants for first pass
             let (output, output_rev, output_counts, output_rev_counts)= output_maps.get(&best_genome_index).unwrap_or_else(|| {
                 error!("Failed to find mapping data for selected genome");
                 std::process::exit(1);
             });
 
-            let (variants, num_major_variants, num_minor_variants, breadth_cov, depth_cov) = call_variants(
+            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
                 &args,
                 output,
                 output_counts,
@@ -488,31 +673,212 @@ pub fn call(args: CallArgs) {
                 !args.no_strand_filter,
                 args.n_per_strand,
                 &best_genome_filename,
+                None, // first pass: original-reference coordinates
             );
+
+
+            // reconstruct indels and sequence ends unless disabled
+            let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
+                info!("Indel reconstruction disabled (--no-indels)");
+                (Vec::new(), Vec::new())
+            } else {
+                let infos = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
+                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64);
+                let n_breakpoints: usize = infos.iter().map(|i| i.breakpoints.len()).sum();
+                let n_pairs: usize = merged_pairs.iter().map(|(_, p)| p.len()).sum();
+                info!("Identified {} breakpoints across {} sequences; planned {} internal indel event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
+                trace!("Planned internal indel pairs: {:?}", merged_pairs);
+                trace!("Planned end anchors: {:?}", end_anchors);
+
+                let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &merged_pairs, args.kmer);
+                info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+                for indel in &reconstructed_indels {
+                    info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
+                }
+
+                let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
+                info!("Reconstructed {} sequence end(s) for the consensus", reconstructed_ends.len());
+                for end in &reconstructed_ends {
+                    info!("  end {} (ref {}-{}) allele: {}", end.seq, end.ref_start, end.ref_end, String::from_utf8_lossy(&end.allele));
+                }
+
+                (reconstructed_indels, reconstructed_ends)
+            };
+
+            // rebuild a consensus from the indels and ends
+            let consensus_edits: Vec<ReconstructedIndel> = reconstructed_indels
+                .iter()
+                .cloned()
+                .chain(reconstructed_ends.iter().filter(|end| {
+                    !reconstructed_indels.iter().any(|ind| ind.seq == end.seq
+                        && end.ref_start <= ind.ref_end && ind.ref_start <= end.ref_end)
+                }).cloned())
+                .collect();
+
+            let has_indels = !consensus_edits.is_empty();
+
+            if !has_indels {
+                info!("No indels or sequence ends were reconstructed, skipping second pass of mapping");
+            } else {
+                info!("Printing reconstructed consensus sequence for sample {} ({} indel/ends)", clean_sample_id(r1), consensus_edits.len());
+            }
+
+            // print the sample consensus so we can use it for the second pass (if anything was reconstructed)
+            if args.output_consensus || has_indels {
+                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
+            }
+
+            // Second pass of mapping if reconstructed
+            let second_pass = if has_indels {
+                let consensus_path = format!("{}/{}.fa", args.output, clean_sample_id(r1));
+                let (new_index, new_meta) = build_indexes(args.kmer, &[consensus_path]).unwrap_or_else(|e| {
+                    error!("{} | Failed to build index from corrected consensus", e);
+                    std::process::exit(1);
+                });
+                info!("Built corrected index from consensus: {} buckets, {} sequence(s)", new_index.len(), new_meta.files.iter().map(|f| f.sequences.len()).sum::<usize>());
+
+                // flanking base counts aren't needed here, so the pass-1 map is reused as a throwaway sink.
+                let new_output_maps = initialize_output_maps(&new_meta);
+                let new_mapping_data_r1 = map_kmers(&kmers1, &new_index, &new_meta, &half_threads, &args, &new_output_maps, &flanking_base_map);
+                let new_mapping_data_r2 = map_kmers(&kmers2, &new_index, &new_meta, &half_threads, &args, &new_output_maps, &flanking_base_map);
+                let (p1, v1, _) = new_mapping_data_r1.get(&0).copied().unwrap_or((0, 0, 0));
+                let (p2, v2, _) = new_mapping_data_r2.get(&0).copied().unwrap_or((0, 0, 0));
+                let (new_perfect, new_variant) = (p1 + p2, v1 + v2);
+                info!("Re-mapped kmers onto corrected consensus: {}/{} perfect, {} variant", new_perfect, unique_counted_kmer_r1 + unique_counted_kmer_r2, new_variant);
+
+                // map each corrected coordinate back to the original reference (positions inside a spliced
+                // indel allele have no original coordinate and are skipped during calling)
+                let mut coord_maps: FxHashMap<String, CoordMap> = FxHashMap::default();
+                for entry in output.iter() {
+                    let seq = entry.key();
+                    let ref_len = entry.value().ref_bases.len();
+                    coord_maps.insert(seq.clone(), build_coord_map(ref_len, seq, &reconstructed_indels));
+                }
+
+                Some((new_meta, new_output_maps, coord_maps, (new_perfect, new_variant)))
+            } else {
+                None
+            };
+
+            // pick the pileup source + metadata all output runs against: the corrected second pass when
+            // present, otherwise the selected genome's first-pass pileup
+            let (cur_output, cur_output_rev, cur_output_counts, cur_output_rev_counts, cur_meta, cur_genome_index, coord_maps_opt) =
+                match &second_pass {
+                    Some((new_meta, new_output_maps, coord_maps, _)) => {
+                        let (o, orv, oc, orc) = new_output_maps.get(&0).unwrap_or_else(|| {
+                            error!("Failed to find mapping data for corrected consensus");
+                            std::process::exit(1);
+                        });
+                        (o, orv, oc, orc, new_meta, 0u16, Some(coord_maps))
+                    }
+                    None => (output, output_rev, output_counts, output_rev_counts, &viral_metadata, best_genome_index, None),
+                };
+            
+            // Print the final variants. First-pass major SNVs are always carried over. If there was a second pass, the
+            // the minor variants and any indels or new SNVs are also carried over and translated position-wise. Without a second pass, the first-pass
+            // call is the final result as-is.
+            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
+                let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
+                    &args,
+                    cur_output,
+                    cur_output_counts,
+                    cur_output_rev,
+                    cur_output_rev_counts,
+                    args.min_af,
+                    !args.no_end_filter,
+                    !args.no_strand_filter,
+                    args.n_per_strand,
+                    &best_genome_filename,
+                    coord_maps_opt, // second pass: translate corrected coords -> original reference
+                );
+
+                let mut merged: Vec<VCFRecord> = Vec::new();
+                let mut major_keys: FxHashSet<(String, usize)> = FxHashSet::default();
+                for r in &first_pass_variants {
+                    if !(r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1) {
+                        continue; // only major SNVs are carried over from the first pass
+                    }
+                    major_keys.insert((r.seq.clone(), r.pos));
+                    let cm = match coord_maps.get(&r.seq) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // a position with no corrected coordinate lies inside a reconstructed indel and is
+                    // subsumed by that indel's record
+                    let corrected = match cm.orig_to_corrected.get(r.pos - 1).copied().flatten() {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // recompute against the second-pass pileup; if it has no coverage there, keep the
+                    // first-pass call
+                    match major_snv_second_pass_record(&r.seq, r.pos, corrected, r.ref_allele[0], r.alt_allele[0], cur_output, cur_output_rev) {
+                        Some(rec) => merged.push(rec),
+                        None => merged.push(r.clone()),
+                    }
+                }
+                // add the second-pass calls except where a first-pass major already reports that position
+                for r in sp_variants {
+                    if !major_keys.contains(&(r.seq.clone(), r.pos)) {
+                        merged.push(r);
+                    }
+                }
+
+                // recount SNVs from the merged set (indel records are added and counted separately below)
+                let num_major_snp = merged.iter().filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+                let num_minor_snp = merged.iter().filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+
+                (merged, num_major_snp, num_minor_snp, sp_breadth, sp_depth)
+            } else {
+                (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth)
+            };
             log_memory_usage(true, "Called variants successfully");
+
+            // emit each reconstructed indel as its own VCF record (original-reference coordinates, depth
+            // pulled from the corrected-consensus pileup), tallying insertions and deletions separately
+            let mut num_insertions = 0;
+            let mut num_deletions = 0;
+            if let Some(coord_maps) = coord_maps_opt {
+                for indel in &reconstructed_indels {
+                    if let Some(coord_map) = coord_maps.get(&indel.seq) {
+                        if let Some(rec) = indel_to_vcf_record(indel, output, output_rev, cur_output, cur_output_rev, coord_map) {
+                            match rec.var_type() {
+                                "INS" => num_insertions += 1,
+                                "DEL" => num_deletions += 1,
+                                _ => {}
+                            }
+                            variants.push(rec);
+                        }
+                    }
+                }
+            }
 
             //print outputs
             if args.output_pileup {
-                print_pileup(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index);
+                print_pileup(&r1, &args, cur_output, cur_output_rev, cur_meta, &cur_genome_index, second_pass.is_some());
             }
 
-            //print consensus
-            if args.output_consensus{
-                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index);
-            }
-
+            // VCF reports in original-reference coordinates regardless of pass
             print_output(&r1, &args, &variants, &viral_metadata, &best_genome_index);
+
+            // kmer mapping statistics: use the corrected second pass when indels were applied, else the
+            // first pass against the selected genome
+            let (out_perfect_kmers, out_variant_kmers, out_unmapped_kmers) = match &second_pass {
+                Some((.., (p, v))) => (*p, *v, (unique_counted_kmer_r1 + unique_counted_kmer_r2).saturating_sub(*p + *v)),
+                None => (*n_perfect_mapped_r1 + *n_perfect_mapped_r2, *n_variant_mapped_r1 + *n_variant_mapped_r2, n_unmapped_kmers),
+            };
 
             output_info.push(OutputInfo {
                 filename: r1.to_string(),
                 selected_genome: best_genome_filename.to_string(),
-                num_major_variants: num_major_variants,
-                num_minor_variants: num_minor_variants,
+                num_major_snp: num_major_snp,
+                num_minor_snp: num_minor_snp,
+                num_insertions: num_insertions,
+                num_deletions: num_deletions,
                 breadth_coverage: breadth_cov,
                 depth_coverage: depth_cov,
-                num_perfect_kmers: *n_perfect_mapped_r1 + *n_perfect_mapped_r2,
-                num_variant_kmers: *n_variant_mapped_r1 + *n_variant_mapped_r2,
-                num_unmapped_kmers: n_unmapped_kmers,
+                num_perfect_kmers: out_perfect_kmers,
+                num_variant_kmers: out_variant_kmers,
+                num_unmapped_kmers: out_unmapped_kmers,
             });
             variant_info.push((r1.to_string(), variants));
             
@@ -721,10 +1087,11 @@ pub fn build_alignment_fasta(
     for (sample, vcf_records) in &sample_variants {
         sample_positions.insert(sample.clone(), FxHashMap::default());
         for variant in vcf_records {
-            if variant.af >= 0.5 { //store the major variants in the full set and the sample set
-                all_positions.insert((variant.seq.clone(), variant.pos), variant.ref_base);
+            // SNP-only alignment: store the single ASCII base of each major substitution (indels skipped)
+            if variant.af >= 0.5 && variant.ref_allele.len() == 1 && variant.alt_allele.len() == 1 {
+                all_positions.insert((variant.seq.clone(), variant.pos), variant.ref_allele[0]);
                 if let Some(sample_map) = sample_positions.get_mut(&sample.clone()) {
-                    sample_map.insert((variant.seq.clone(), variant.pos), variant.alt_base);
+                    sample_map.insert((variant.seq.clone(), variant.pos), variant.alt_allele[0]);
                 }
             }
         }
@@ -746,7 +1113,7 @@ pub fn build_alignment_fasta(
     for pos_key in &positions {
         let ref_base = all_positions
             .get(pos_key)
-            .map(|&b| nucleotide_bits_to_char(b as u64))
+            .map(|&b| b as char)
             .unwrap_or('N');
         ref_seq.push(ref_base);
     }
@@ -757,14 +1124,14 @@ pub fn build_alignment_fasta(
         let mut seq = String::with_capacity(positions.len());
 
         for pos_key in &positions {
-            // If the sample has a variant at this position, use the alt_base
+            // If the sample has a variant at this position, use the alt base
             if let Some(&alt_base) = sample_map.get(pos_key) {
-                seq.push(nucleotide_bits_to_char(alt_base as u64)); // u8 → char
+                seq.push(alt_base as char); // ASCII byte → char
             } else {
                 // Otherwise fall back to reference base from all_positions
                 let ref_base = all_positions
                     .get(pos_key)
-                    .map(|&b| nucleotide_bits_to_char(b as u64))
+                    .map(|&b| b as char)
                     .unwrap_or('N');
                 seq.push(ref_base);
             }
@@ -802,7 +1169,8 @@ pub fn print_pileup(
     output: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
     viral_metadata: &ViralMetadata,
-    best_genome_index: &u16, 
+    best_genome_index: &u16,
+    reconstructed: bool, // pileup is against the indel-corrected consensus (sets the reference_source column)
 ){
     info!("Writing output to pileup");
 
@@ -814,10 +1182,13 @@ pub fn print_pileup(
     });
     let mut writer = BufWriter::new(tsv_pileup);
 
-    writeln!(writer, "reference\tindex\tref\tA\tC\tG\tT\ta\tc\tg\tt").unwrap();
+    writeln!(writer, "reference\treference_source\tindex\tref\tA\tC\tG\tT\ta\tc\tg\tt").unwrap();
 
 
     let file_meta = &viral_metadata.files[*best_genome_index as usize];
+
+    // whether the pileup reflects the original reference or the indel-corrected consensus
+    let reference_source = if reconstructed { "reconstructed" } else { "original" };
 
     for seq_entry in &file_meta.sequences {
         let seq = &seq_entry.name;
@@ -828,8 +1199,9 @@ pub fn print_pileup(
         for (i, ref_base) in fwd.ref_bases.iter().enumerate() {
             writeln!(
                 writer,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 seq,
+                reference_source,
                 i + 1,
                 *ref_base as char,
                 fwd.counts[i][0],
@@ -851,7 +1223,9 @@ pub fn print_consensus(
     output: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
     viral_metadata: &ViralMetadata,
-    best_genome_index: &u16, 
+    best_genome_index: &u16,
+    reconstructed_indels: &[ReconstructedIndel],
+    major_variants: &[VCFRecord], // first-pass called variants; the major SNVs are applied to the consensus
 ){
     info!("Writing output to pileup");
 
@@ -865,47 +1239,39 @@ pub fn print_consensus(
 
     let file_meta = &viral_metadata.files[*best_genome_index as usize];
 
-    let bases = [b'A', b'C', b'G', b'T'];
-
-    let mut line_len: usize = 0;
-
     for seq_entry in &file_meta.sequences {
         let seq = &seq_entry.name;
 
         let fwd = output.get(seq).expect("Could not match seq to fwd counts");
         let rev = output_rev.get(seq).expect("Could not match seq to rev counts");
 
-        writeln!(writer, ">{}", seq).unwrap();
+        // start from the reference: keep the reference base where covered, N where there is no coverage
+        let mut consensus: Vec<u8> = Vec::with_capacity(fwd.ref_bases.len());
+        for (i, &ref_base) in fwd.ref_bases.iter().enumerate() {
+            let total_depth: u64 = (0..4).map(|b| fwd.counts[i][b] + rev.counts[i][b]).sum();
+            consensus.push(if total_depth == 0u64 { b'N' } else { ref_base });
+        }
 
-        for (i, _) in fwd.ref_bases.iter().enumerate() {
-            let row = fwd.counts[i];
-            let row_rev = rev.counts[i];
-
-            let row_total: Vec<u64> = (0..4)
-                .map(|b| row[b] + row_rev[b])
-                .collect();
-            let total_depth: u64 = row_total.iter().sum();
-
-            let consensus_base = if total_depth == 0u64 {
-                b'N'
-            } else {
-                let (max_i, _) = row_total.iter().enumerate().max_by_key(|(_, c)| *c).unwrap();
-                bases[max_i]
-            };
-
-            writer.write_all(&[consensus_base]).unwrap();
-            line_len += 1;
-
-            if line_len == DEFAULT_LINE_WRAP {
-                writer.write_all(b"\n").unwrap();
-                line_len = 0;
+        // apply the first-pass called major variants (AF >= 0.5 substitutions) for this sequence, so the
+        // consensus only deviates from the reference at confident, filter-passing calls
+        for v in major_variants {
+            if v.seq == *seq && v.af >= 0.5 && v.ref_allele.len() == 1 && v.alt_allele.len() == 1 {
+                if v.pos >= 1 && v.pos <= consensus.len() {
+                    consensus[v.pos - 1] = v.alt_allele[0];
+                }
             }
-
         }
 
-        if line_len != 0 {
-            writer.write_all(b"\n\n").unwrap();
+        // splice the reconstructed indels for this sequence into the consensus (footprints share the
+        // reference coordinate system, so they line up with the consensus buffer)
+        let final_seq = splice_indels(&consensus, seq, reconstructed_indels);
+
+        writeln!(writer, ">{}", seq).unwrap();
+        for chunk in final_seq.chunks(DEFAULT_LINE_WRAP) {
+            writer.write_all(chunk).unwrap();
+            writer.write_all(b"\n").unwrap();
         }
+        writer.write_all(b"\n").unwrap(); // blank line between sequences
     }
 }
 
@@ -925,18 +1291,20 @@ pub fn print_output_info(args: &CallArgs, output_info: &Vec<OutputInfo>) {
     // header
     writeln!(
         writer,
-        "filename\tselected_genome\tnum_major_variants\tnum_minor_variants\tbreadth_coverage\tdepth_coverage\tnum_perfect_kmers\tnum_variant_kmers\tnum_unmapped_kmers"
+        "filename\tselected_genome\tnum_major_snp\tnum_minor_snp\tnum_insertions\tnum_deletions\tbreadth_coverage\tdepth_coverage\tnum_perfect_kmers\tnum_variant_kmers\tnum_unmapped_kmers"
     ).unwrap();
 
     // rows
     for info in output_info {
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{}",
             info.filename,
             info.selected_genome,
-            info.num_major_variants,
-            info.num_minor_variants,
+            info.num_major_snp,
+            info.num_minor_snp,
+            info.num_insertions,
+            info.num_deletions,
             info.breadth_coverage,
             info.depth_coverage,
             info.num_perfect_kmers,
@@ -980,11 +1348,37 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">").unwrap();
     writeln!(writer, "##INFO=<ID=DP4,Number=4,Type=Integer,Description=\"Fwd_ref,Rev_ref,Fwd_alt,Rev_alt\">").unwrap();
     writeln!(writer, "##INFO=<ID=SOR,Number=4,Type=Float,Description=\"SOR\">").unwrap();
+    writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, MNV, INS, DEL)\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
-    for variant in variants{
+    // sort records by contig (in the order contigs are declared above) then by position, so the
+    // separately-appended indel records interleave with the SNVs instead of trailing at the end
+    let contig_order: FxHashMap<&str, usize> = file_meta
+        .sequences
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+    let mut sorted: Vec<&VCFRecord> = variants.iter().collect();
+    sorted.sort_by(|a, b| {
+        let ai = contig_order.get(a.seq.as_str()).copied().unwrap_or(usize::MAX);
+        let bi = contig_order.get(b.seq.as_str()).copied().unwrap_or(usize::MAX);
+        ai.cmp(&bi).then(a.pos.cmp(&b.pos))
+    });
+
+    for variant in sorted{
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
-        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3}", seq_out, variant.pos, nucleotide_bits_to_char(variant.ref_base as u64), nucleotide_bits_to_char(variant.alt_base as u64), variant.depth, variant.af, variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt, variant.sor).unwrap()
+        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};TYPE={}",
+            seq_out,
+            variant.pos,
+            String::from_utf8_lossy(&variant.ref_allele),
+            String::from_utf8_lossy(&variant.alt_allele),
+            variant.depth,
+            variant.af,
+            variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt,
+            variant.sor,
+            variant.var_type()
+        ).unwrap()
     }
 }
 
@@ -992,8 +1386,8 @@ pub fn print_output(
 pub struct VCFRecord{
     seq: String,
     pos: usize,
-    ref_base: u8,
-    alt_base: u8,
+    ref_allele: Vec<u8>, // ASCII REF allele (length 1 for SNPs, multi-base for indels/MNVs)
+    alt_allele: Vec<u8>, // ASCII ALT allele
     fwd_ref: u64,
     rev_ref: u64,
     fwd_alt: u64,
@@ -1001,6 +1395,138 @@ pub struct VCFRecord{
     depth: u64,
     af: f64,
     sor: f64
+}
+
+impl VCFRecord {
+    // VCF variant type inferred from allele lengths: equal-length-1 = SNP, equal-length>1 = MNV,
+    // ALT longer = INS, REF longer = DEL
+    fn var_type(&self) -> &'static str {
+        match (self.ref_allele.len(), self.alt_allele.len()) {
+            (r, a) if r == a && r == 1 => "SNP",
+            (r, a) if r == a => "MNV",
+            (r, a) if a > r => "INS",
+            _ => "DEL",
+        }
+    }
+}
+
+// Build a VCF record for a reconstructed indel. REF is the original-reference footprint the allele
+// replaced and ALT is the reconstructed allele. The two alleles drop out of opposite pileups, so each
+// is measured where it maps cleanly: the REF allele (reads without the indel) from the first-pass
+// pileup over the disrupted footprint, and the ALT allele (reads with the indel) from the second-pass
+// (corrected consensus) pileup over the spliced-in allele. Each side takes the weakest (minimum total
+// depth) position across its span, which lands in the disrupted region rather than the well-covered
+// anchors. Those per-strand counts give DP4, AF, DP and the strand odds ratio. The shared flanks are
+// then trimmed to a single anchor base and the start is reported in the original reference. Returns
+// None if the indel can't be located/translated (e.g. footprint out of range or abutting another indel).
+fn indel_to_vcf_record(
+    indel: &ReconstructedIndel,
+    orig_output: &DashMap<String, OutputData>,
+    orig_output_rev: &DashMap<String, OutputData>,
+    new_output: &DashMap<String, OutputData>,
+    new_output_rev: &DashMap<String, OutputData>,
+    coord_map: &CoordMap,
+) -> Option<VCFRecord> {
+    // REF allele: original reference bases over the 1-based inclusive footprint [ref_start, ref_end], plus
+    // the first-pass reference-allele support. The reference allele is what still covers the disrupted
+    // footprint in the first pass; the minimum-depth position lands in the dip (the deleted bases for a
+    // deletion, or the junction dip for an insertion).
+    let (ref_allele, ref_fwd, ref_rev) = {
+        let orig = orig_output.get(&indel.seq)?;
+        let orig_rev = orig_output_rev.get(&indel.seq)?;
+        if indel.ref_start < 1 || indel.ref_end > orig.ref_bases.len() || indel.ref_start > indel.ref_end {
+            return None;
+        }
+        let ref_allele = orig.ref_bases[indel.ref_start - 1..indel.ref_end].to_vec();
+
+        let mut rep = indel.ref_start - 1;
+        let mut min_total = u64::MAX;
+        for p in (indel.ref_start - 1)..indel.ref_end {
+            let total: u64 = (0..4).map(|b| orig.counts[p][b] + orig_rev.counts[p][b]).sum();
+            if total < min_total {
+                min_total = total;
+                rep = p;
+            }
+        }
+        let ref_base = nt_to_bits(orig.ref_bases[rep]) as usize;
+        (ref_allele, orig.counts[rep][ref_base], orig_rev.counts[rep][ref_base])
+    };
+
+    // locate the allele in corrected coordinates: it begins just after the corrected position of the
+    // reference base preceding the footprint (or at 0 when the footprint starts the sequence)
+    let c_start = if indel.ref_start >= 2 {
+        coord_map.orig_to_corrected.get(indel.ref_start - 2).copied().flatten()? + 1
+    } else {
+        0
+    };
+
+    // ALT allele: second-pass support over the spliced-in allele, again at the weakest spanning position
+    let (alt_fwd, alt_rev) = {
+        let fwd = new_output.get(&indel.seq)?;
+        let rev = new_output_rev.get(&indel.seq)?;
+        let c_end = (c_start + indel.allele.len()).min(fwd.counts.len());
+        if c_start >= c_end {
+            return None;
+        }
+        let mut rep = c_start;
+        let mut min_total = u64::MAX;
+        for p in c_start..c_end {
+            let total: u64 = (0..4).map(|b| fwd.counts[p][b] + rev.counts[p][b]).sum();
+            if total < min_total {
+                min_total = total;
+                rep = p;
+            }
+        }
+        let alt_base = nt_to_bits(fwd.ref_bases[rep]) as usize;
+        (fwd.counts[rep][alt_base], rev.counts[rep][alt_base])
+    };
+
+    let ref_total = ref_fwd + ref_rev;
+    let alt_total = alt_fwd + alt_rev;
+    let depth = ref_total + alt_total;
+    let af = if depth > 0 { alt_total as f64 / depth as f64 } else { 0.0 };
+    let sor = strand_odds_ratio(ref_fwd, ref_rev, alt_fwd, alt_rev);
+
+    // trim the shared suffix entirely, then the shared prefix down to a single anchor base, shifting the
+    // reported start past the trimmed prefix (standard compact indel representation)
+    let mut ref_a = ref_allele;
+    let mut alt_a = indel.allele.clone();
+
+    let mut s = 0usize;
+    while ref_a.len() - s > 1
+        && alt_a.len() - s > 1
+        && ref_a[ref_a.len() - 1 - s] == alt_a[alt_a.len() - 1 - s]
+    {
+        s += 1;
+    }
+    ref_a.truncate(ref_a.len() - s);
+    alt_a.truncate(alt_a.len() - s);
+
+    let mut p = 0usize;
+    while p + 1 < ref_a.len() && p + 1 < alt_a.len() && ref_a[p] == alt_a[p] {
+        p += 1;
+    }
+    let pos = indel.ref_start + p;
+    let ref_a = ref_a[p..].to_vec();
+    let alt_a = alt_a[p..].to_vec();
+
+    if ref_a == alt_a {
+        return None; // not an actual difference after trimming
+    }
+
+    Some(VCFRecord {
+        seq: indel.seq.clone(),
+        pos,
+        ref_allele: ref_a,
+        alt_allele: alt_a,
+        fwd_ref: ref_fwd,
+        rev_ref: ref_rev,
+        fwd_alt: alt_fwd,
+        rev_alt: alt_rev,
+        depth,
+        af,
+        sor,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1181,8 +1707,69 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
 
 }
 
+// GATK strand odds ratio from a 2x2 strand table (ref/alt x fwd/rev), with +1 pseudocounts so it is
+// always defined. Higher values indicate stronger strand bias.
+fn strand_odds_ratio(ref_fwd: u64, ref_rev: u64, alt_fwd: u64, alt_rev: u64) -> f64 {
+    let a = ref_fwd as f64 + 1.0; // ref fwd
+    let b = ref_rev as f64 + 1.0; // ref rev
+    let c = alt_fwd as f64 + 1.0; // alt fwd
+    let d = alt_rev as f64 + 1.0; // alt rev
+
+    let r = (a * d) / (b * c);
+    let ref_ratio = a.min(b) / a.max(b);
+    let alt_ratio = c.min(d) / c.max(d);
+
+    (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln()
+}
+
+// Recompute a first-pass major SNV against the second-pass (corrected consensus) pileup at its corrected
+// position, so the reported depth/AF/strand counts reflect the improved mapping. REF stays the original
+// reference base and ALT the major allele (now the consensus base); the variant is reported at its
+// original-reference position. Returns None if the corrected position has no coverage (the caller then
+// keeps the first-pass call).
+fn major_snv_second_pass_record(
+    seq: &str,
+    orig_pos: usize,    // 1-based original-reference position
+    corrected: usize,   // 0-based position in the corrected-consensus pileup
+    ref_base: u8,       // ASCII original reference base
+    alt_base: u8,       // ASCII major-variant allele (the consensus base)
+    new_output: &DashMap<String, OutputData>,
+    new_output_rev: &DashMap<String, OutputData>,
+) -> Option<VCFRecord> {
+    let fwd = new_output.get(seq)?;
+    let rev = new_output_rev.get(seq)?;
+    if corrected >= fwd.counts.len() {
+        return None;
+    }
+    let total_depth: u64 = (0..4).map(|b| fwd.counts[corrected][b] + rev.counts[corrected][b]).sum();
+    if total_depth == 0 {
+        return None;
+    }
+    let rb = nt_to_bits(ref_base) as usize;
+    let ab = nt_to_bits(alt_base) as usize;
+    let fwd_ref = fwd.counts[corrected][rb];
+    let rev_ref = rev.counts[corrected][rb];
+    let fwd_alt = fwd.counts[corrected][ab];
+    let rev_alt = rev.counts[corrected][ab];
+    let af = (fwd_alt + rev_alt) as f64 / total_depth as f64;
+    let sor = strand_odds_ratio(fwd_ref, rev_ref, fwd_alt, rev_alt);
+    Some(VCFRecord {
+        seq: seq.to_string(),
+        pos: orig_pos,
+        ref_allele: vec![ref_base],
+        alt_allele: vec![alt_base],
+        fwd_ref,
+        rev_ref,
+        fwd_alt,
+        rev_alt,
+        depth: total_depth,
+        af,
+        sor,
+    })
+}
+
 pub fn call_variants(
-    args: &CallArgs, 
+    args: &CallArgs,
     output: &DashMap<String, OutputData>,
     output_count: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
@@ -1191,7 +1778,8 @@ pub fn call_variants(
     filter_end_seq: bool,
     strand_filter: bool,
     n_kmer_per_strand: usize,
-    filename: &String, 
+    filename: &String,
+    coord_map: Option<&FxHashMap<String, CoordMap>>, // second pass: translate corrected coords -> original reference
 ) -> (Vec<VCFRecord>, usize, usize, f64, f64) {
 
     info!("Calling variants for {}", filename);
@@ -1248,13 +1836,15 @@ pub fn call_variants(
                 continue; // skip non-ACGT
             }
 
-            let pos = i + 1;
-
             // calculate the depths, including those of fwd and reverse, find the min and max of the two for strand filtering purposes
             let row_total: Vec<u64> = (0..4)
                 .map(|b| row[b] + row_rev[b])
                 .collect();
 
+            // tally coverage here, before any coord translation, so breadth/depth are computed the same
+            // way regardless of pass -- over every covered position of whichever pileup table was passed
+            // in. On the second pass this includes positions inside a reconstructed indel allele, which
+            // are real covered positions of the corrected consensus.
             let total_depth = row_total.iter().sum();
             if total_depth == 0 {
                 continue; //maybe replace down the line with logic to fix things
@@ -1262,6 +1852,17 @@ pub fn call_variants(
                 positions_covered += 1;
                 total_coverage += total_depth as usize;
             }
+
+            // on the second pass, `i` is a corrected-consensus coordinate; translate it back to the
+            // original reference. Positions inside a reconstructed indel have no original coordinate, so
+            // they are skipped for variant calling (the indel itself is reported as its own record).
+            let pos = match coord_map {
+                Some(maps) => match maps.get(seq).and_then(|m| m.corrected_to_orig.get(i).copied().flatten()) {
+                    Some(o) => o + 1, // 1-based original coordinate
+                    None => continue,
+                },
+                None => i + 1,
+            };
 
             // loop through each base and variant call if not the reference base
             for alt_base in 0u8..4 {
@@ -1284,14 +1885,10 @@ pub fn call_variants(
 
                     //if the strand balance filter is on (default), then always do SOR filter
                     //if the strand balance filter is off, then only do SOR filter when 1 strand is > strand_balance_ratio of total depth (by default 10% of total depth, aka all cases where 1 strand is less than 10% of the total depth are ignored)
-                    if (!args.no_strand_balance_filter) | ((args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) { 
-                        
+                    if (!args.no_strand_balance_filter) | ((args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) {
+
                         //Using GATK strand odds ratio
-                        let r = (a*d)/(b*c);
-                        let ref_ratio = (a.min(b)) / (a.max(b));
-                        let alt_ratio = (c.min(d)) / (c.max(d));
-                        
-                        sor = (r + (1.0 / r)).ln() + ref_ratio.ln() - alt_ratio.ln(); 
+                        sor = strand_odds_ratio(row[ref_base as usize], row_rev[ref_base as usize], row[alt_base as usize], row_rev[alt_base as usize]);
 
                         // filter out if greater than strand odds ratio (default 8)
                         if sor > args.strand_odds_max {
@@ -1337,12 +1934,12 @@ pub fn call_variants(
                     num_minor_variants += 1;
                 }
 
-                results.push(VCFRecord { 
-                    seq: seq.clone(), 
-                    pos: pos, 
-                    ref_base: ref_base, 
-                    alt_base: alt_base, 
-                    fwd_ref: row[ref_base as usize], 
+                results.push(VCFRecord {
+                    seq: seq.clone(),
+                    pos: pos,
+                    ref_allele: vec![nucleotide_bits_to_char(ref_base as u64) as u8],
+                    alt_allele: vec![nucleotide_bits_to_char(alt_base as u64) as u8],
+                    fwd_ref: row[ref_base as usize],
                     rev_ref: row_rev[ref_base as usize],
                     fwd_alt: row[alt_base as usize],
                     rev_alt: row_rev[alt_base as usize],
@@ -1496,6 +2093,7 @@ pub fn map_kmers(
             DashMap<String, OutputData>,
         ),
     >,
+    flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
 ) -> FxHashMap<u16, (usize, usize, usize)> {
     let k = args.kmer;
 
@@ -1504,26 +2102,49 @@ pub fn map_kmers(
     let results: DashMap<u16, (usize, usize, usize)> = DashMap::new();
     
     let chunk_size = if ((kmers.len() / threads) as usize) < 10000 { max(kmers.len() / threads, 100) as usize } else { 10000 };
+    //let keep_mask = bucket_keep_mask(&args.bucket_pattern, args.bucket_stride);
 
     kmers.par_chunks(chunk_size).for_each(|chunk| {
 
-        //key is the index of the file in ViralMetadata, values are number of perfectly mapped and 1-edit distance kmers and unique perfectly mapped kmers
-        let mut local_counts: FxHashMap<u16, (usize, usize, usize)> = FxHashMap::default(); //storing the number of perfectly mapped kmers (buckets found = len(filtered_buckets)) and variant mapped kmers (buckets found = 1) and unique perfect (perfect and only mapped to 1 genome) in thread
+        let mut local_counts: FxHashMap<u16, (usize, usize, usize)> = FxHashMap::default();
+
+        // Thread-local output accumulators: (file_id, seq_id) -> position -> [base0..base3]
+        // Avoids per-bucket DashMap lock; one DashMap write per sequence per chunk at merge time.
+        type SeqKey = (u16, u8);
+        let mut local_fwd_sum: FxHashMap<SeqKey, FxHashMap<usize, [u64; 4]>> = FxHashMap::default();
+        let mut local_fwd_max: FxHashMap<SeqKey, FxHashMap<usize, [u64; 4]>> = FxHashMap::default();
+        let mut local_rev_sum: FxHashMap<SeqKey, FxHashMap<usize, [u64; 4]>> = FxHashMap::default();
+        let mut local_rev_max: FxHashMap<SeqKey, FxHashMap<usize, [u64; 4]>> = FxHashMap::default();
+
+        let mut local_flanking: FxHashMap<u64, [[u64; 4]; 2]> = FxHashMap::default();
 
         for (kmer, n) in chunk {
 
             let (kmer_bin, rc) = canonical_kmer(kmer.as_bytes(), k);
             let buckets = assign_buckets(kmer_bin, k);
 
-            let filtered_buckets = if args.use_full_kmer {
-                buckets
-            } else {
-                let len = buckets.len();
-                if args.n_fixed * 2 + 1 >= len {
-                    vec![] 
+            //record the first and last bucket of the kmer with the base of the first/last character (canonical orientation), depth-weighted by n
+            let rc_idx = rc as usize;
+            let first_base = ((kmer_bin >> (2 * (k - 1))) & 0b11) as usize;
+            let last_base = (kmer_bin & 0b11) as usize;
+            local_flanking.entry(buckets[0]).or_insert([[0u64; 4]; 2])[rc_idx][first_base] += *n;
+            local_flanking.entry(buckets[k - 1]).or_insert([[0u64; 4]; 2])[rc_idx][last_base] += *n;
+
+            let filtered_buckets: Vec<u64> = {
+                let (start, end) = if args.use_full_kmer {
+                    (0, buckets.len())
                 } else {
-                    buckets[args.n_fixed..len - args.n_fixed - 1].to_vec()
-                }
+                    let len = buckets.len();
+                    if args.n_fixed * 2 + 1 >= len {
+                        (0, 0)
+                    } else {
+                        (args.n_fixed, len - args.n_fixed - 1)
+                    }
+                };
+                buckets[start..end].iter().enumerate()
+                    //.filter(|(i, _)| keep_mask[(i + start) % keep_mask.len()])
+                    .map(|(_, &b)| b)
+                    .collect()
             };
 
             let num_buckets_perfect = filtered_buckets.len();
@@ -1534,82 +2155,40 @@ pub fn map_kmers(
                 if let Some(bucket_infos) = index.get(&bucket) {
 
                     for info in bucket_infos {
-                        // NEED TO UPDATE TO FILTER OUT DUPLICATE BUCKETS IN GENOMES (Problem is that buckets could be from multiple)
-
-                        //get sequence info from metadata
-                        let file_meta = &viral_metadata.files[info.file_id as usize];
-                        
-                        //update the number of hits for this kmer
                         *per_genome_bucket_hits
                             .entry(info.file_id.clone())
                             .or_insert(0) += 1;
 
-                        //get sequence name as well
-                        let seq_meta = &file_meta.sequences[info.seq_id as usize];
-                        let seq = &seq_meta.name;
+                        let genome_pos = info.location as usize;
+                        let nuc_x = info.idx as usize;
+                        let idx = genome_pos + nuc_x;
+                        let key: SeqKey = (info.file_id, info.seq_id);
 
-                        if let Some(maps) = output_maps.get(&info.file_id) {
-                            let (output, output_rev, output_counts, output_rev_counts) = maps;
-
-                            //get genome position and variant position in kmer
-                            let genome_pos = info.location as usize;
-                            let nuc_x = info.idx as usize;
-                            
-                            if info.canonical {
-                                let pos = k - nuc_x - 1;
-                                let bit_idx = (((kmer_bin >> (2 * (k - pos - 1))) & 0b11) ^ 0b11) as usize;
-                                let idx  = genome_pos + nuc_x;
-
-                                if rc {
-                                    if let Some(mut rec) = output_counts.get_mut(seq) {
-                                        rec.counts[idx][bit_idx] += 1;
-                                    }
-        
-                                    if let Some(mut rec) = output.get_mut(seq) {
-                                        if rec.counts[idx][bit_idx] < *n {
-                                            rec.counts[idx][bit_idx] = *n;
-                                        }
-                                    }
-                                } else {
-
-                                    if let Some(mut rec) = output_rev_counts.get_mut(seq) {
-                                        rec.counts[idx][bit_idx] += 1;
-                                    }
-        
-                                    if let Some(mut rec) = output_rev.get_mut(seq) {
-                                        if rec.counts[idx][bit_idx] < *n {
-                                            rec.counts[idx][bit_idx] = *n;
-                                        }
-                                    }
-                                }
+                        if info.canonical {
+                            // pos = k - nuc_x - 1, so k - pos - 1 = nuc_x
+                            let bit_idx = (((kmer_bin >> (2 * nuc_x)) & 0b11) ^ 0b11) as usize;
+                            if rc {
+                                local_fwd_sum.entry(key).or_default().entry(idx).or_insert([0u64; 4])[bit_idx] += 1;
+                                let e = local_fwd_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
+                                if e[bit_idx] < *n { e[bit_idx] = *n; }
                             } else {
-                                let pos = nuc_x;
-                                let bit_idx = ((kmer_bin >> (2* (k - pos - 1))) & 0b11) as usize;
-                                let idx = genome_pos + nuc_x;
-
-                                if rc {
-                                    if let Some(mut rec) = output_rev_counts.get_mut(seq) {
-                                        rec.counts[idx][bit_idx] += 1;
-                                    }
-        
-                                    if let Some(mut rec) = output_rev.get_mut(seq) {
-                                        if rec.counts[idx][bit_idx] < *n {
-                                            rec.counts[idx][bit_idx] = *n;
-                                        }
-                                    }
-                                } else {
-                                    if let Some(mut rec) = output_counts.get_mut(seq) {
-                                        rec.counts[idx][bit_idx] += 1;
-                                    }
-        
-                                    if let Some(mut rec) = output.get_mut(seq) {
-                                        if rec.counts[idx][bit_idx] < *n {
-                                            rec.counts[idx][bit_idx] = *n;
-                                        }
-                                    }
-                                }    
+                                local_rev_sum.entry(key).or_default().entry(idx).or_insert([0u64; 4])[bit_idx] += 1;
+                                let e = local_rev_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
+                                if e[bit_idx] < *n { e[bit_idx] = *n; }
                             }
-                        }    
+                        } else {
+                            // pos = nuc_x, so k - pos - 1 = k - nuc_x - 1
+                            let bit_idx = ((kmer_bin >> (2 * (k - nuc_x - 1))) & 0b11) as usize;
+                            if rc {
+                                local_rev_sum.entry(key).or_default().entry(idx).or_insert([0u64; 4])[bit_idx] += 1;
+                                let e = local_rev_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
+                                if e[bit_idx] < *n { e[bit_idx] = *n; }
+                            } else {
+                                local_fwd_sum.entry(key).or_default().entry(idx).or_insert([0u64; 4])[bit_idx] += 1;
+                                let e = local_fwd_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
+                                if e[bit_idx] < *n { e[bit_idx] = *n; }
+                            }
+                        }
                     }
                 }
             }
@@ -1644,6 +2223,41 @@ pub fn map_kmers(
                 entry.2 += 1; // perfect + unique
             }
         }
+        // merge thread-local output buffers into shared DashMaps.
+        
+        for ((file_id, seq_id), pos_map) in local_fwd_sum {
+            if let Some(maps) = output_maps.get(&file_id) {
+                let seq = &viral_metadata.files[file_id as usize].sequences[seq_id as usize].name;
+                if let Some(mut rec) = maps.2.get_mut(seq) {
+                    for (pos, vals) in pos_map { for b in 0..4 { rec.counts[pos][b] += vals[b]; } }
+                }
+            }
+        }
+        for ((file_id, seq_id), pos_map) in local_fwd_max {
+            if let Some(maps) = output_maps.get(&file_id) {
+                let seq = &viral_metadata.files[file_id as usize].sequences[seq_id as usize].name;
+                if let Some(mut rec) = maps.0.get_mut(seq) {
+                    for (pos, vals) in pos_map { for b in 0..4 { if rec.counts[pos][b] < vals[b] { rec.counts[pos][b] = vals[b]; } } }
+                }
+            }
+        }
+        for ((file_id, seq_id), pos_map) in local_rev_sum {
+            if let Some(maps) = output_maps.get(&file_id) {
+                let seq = &viral_metadata.files[file_id as usize].sequences[seq_id as usize].name;
+                if let Some(mut rec) = maps.3.get_mut(seq) {
+                    for (pos, vals) in pos_map { for b in 0..4 { rec.counts[pos][b] += vals[b]; } }
+                }
+            }
+        }
+        for ((file_id, seq_id), pos_map) in local_rev_max {
+            if let Some(maps) = output_maps.get(&file_id) {
+                let seq = &viral_metadata.files[file_id as usize].sequences[seq_id as usize].name;
+                if let Some(mut rec) = maps.1.get_mut(seq) {
+                    for (pos, vals) in pos_map { for b in 0..4 { if rec.counts[pos][b] < vals[b] { rec.counts[pos][b] = vals[b]; } } }
+                }
+            }
+        }
+
         // merge local counts into global DashMap
         for (file_index, (perfect, variant, unique_perfect)) in local_counts {
             results
@@ -1655,6 +2269,20 @@ pub fn map_kmers(
                 })
                 .or_insert((perfect, variant, unique_perfect));
         }
+
+        // merge local flanking base counts into the global DashMap
+        for (bucket, counts) in local_flanking {
+            flanking_base_map
+                .entry(bucket)
+                .and_modify(|e| {
+                    for r in 0..2 {
+                        for b in 0..4 {
+                            e[r][b] += counts[r][b];
+                        }
+                    }
+                })
+                .or_insert(counts);
+        }
     });
 
     //ensure that each genome has 0s filled if nothing is mapped, otherwise error thrown downstream
@@ -1665,6 +2293,7 @@ pub fn map_kmers(
 
     results.into_iter().collect()
 }
+
 
 
 pub fn initialize_output_maps(
