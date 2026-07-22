@@ -3,12 +3,12 @@ use crate::lcb::*;
 use crate::util::*;
 use crate::build::*;
 use crate::indels::*;
+use crate::consts::*;
 
 use anyhow::{Result};
 
 use num_cpus;
 use log::*;
-use crate::consts::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use dashmap::DashMap;
 use bincode::{config};
@@ -281,7 +281,7 @@ pub fn call(args: CallArgs) {
         error!("No sequencing datasets provided using -r or -1/-2 or --file-input, exiting");
         std::process::exit(1);
     } else {
-        info!("Read in {} sequencing datasets ({} single end, {} paired end)", n_pe_seq_datasets + n_se_seq_datasets, n_pe_seq_datasets, n_se_seq_datasets);
+        info!("Read in {} sequencing datasets ({} single end, {} paired end)", n_pe_seq_datasets + n_se_seq_datasets, n_se_seq_datasets, n_pe_seq_datasets);
     }
 
     // create output directory
@@ -379,14 +379,28 @@ pub fn call(args: CallArgs) {
             }
 
             
-            // call variants and print them out to vcf
+            // first pass to call variants
             let (output, output_rev, output_counts, output_rev_counts)= output_maps.get(&best_genome_index).unwrap_or_else(|| {
                 error!("Failed to find mapping data for selected genome");
                 std::process::exit(1);
             });
 
-            // reconstruct indels and sequence ends unless disabled. Internal indels are reported and
-            // translated as variants; end reconstructions only improve the consensus we re-map to.
+            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
+                &args,
+                output,
+                output_counts,
+                output_rev,
+                output_rev_counts,
+                args.min_af,
+                !args.no_end_filter,
+                !args.no_strand_filter,
+                args.n_per_strand,
+                &best_genome_filename,
+                None, // first pass: original-reference coordinates
+            );
+
+
+            // reconstruct indels and sequence ends unless disabled
             let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
                 info!("Indel reconstruction disabled (--no-indels)");
                 (Vec::new(), Vec::new())
@@ -405,8 +419,6 @@ pub fn call(args: CallArgs) {
                     info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
                 }
 
-                // generalize reconstruction to the sequence ends, for the consensus only (capped at the
-                // reference length; bases the walk can't reach stay as the consensus's N)
                 let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
                 info!("Reconstructed {} sequence end(s) for the consensus", reconstructed_ends.len());
                 for end in &reconstructed_ends {
@@ -416,10 +428,7 @@ pub fn call(args: CallArgs) {
                 (reconstructed_indels, reconstructed_ends)
             };
 
-            // the consensus we re-map to incorporates internal indels and end reconstructions; only the
-            // internal indels are reported/translated as variants. Ends are length-preserving, so the
-            // internal-indel-only coordinate map stays consistent with the spliced consensus. Drop any end
-            // that overlaps an internal indel footprint so the splice and that map stay in agreement.
+            // rebuild a consensus from the indels and ends
             let consensus_edits: Vec<ReconstructedIndel> = reconstructed_indels
                 .iter()
                 .cloned()
@@ -431,33 +440,18 @@ pub fn call(args: CallArgs) {
 
             let has_indels = !consensus_edits.is_empty();
 
-            // first-pass variant call: its major variants seed the consensus, and it is the final result
-            // when no second pass is needed
-            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
-                &args,
-                output,
-                output_counts,
-                output_rev,
-                output_rev_counts,
-                args.min_af,
-                !args.no_end_filter,
-                !args.no_strand_filter,
-                args.n_per_strand,
-                &best_genome_filename,
-                None, // first pass: original-reference coordinates
-            );
+            if !has_indels {
+                info!("No indels or sequence ends were reconstructed, skipping second pass of mapping");
+            } else {
+                info!("Printing reconstructed consensus sequence for sample {} ({} indel/ends)", clean_sample_id(se_read), consensus_edits.len());
+            }
 
-            // print consensus (also written whenever there are edits, since we re-index from it): apply the
-            // first-pass called major variants over the reference, then splice in the reconstructed indels/ends
+            // print the sample consensus so we can use it for the second pass (if anything was reconstructed)
             if args.output_consensus || has_indels {
                 print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
             }
 
-            // When indels were reconstructed, the consensus was rewritten with those indels spliced in:
-            // build an index from that corrected consensus and re-map the already-counted kmers onto it
-            // (a single genome -> index 0). All downstream output (variant calling, pileup, coverage
-            // stats) then runs against this corrected pass; coord_maps translates each corrected position
-            // back to the original reference so the VCF stays in original-reference coordinates.
+            // Second pass of mapping if reconstructed
             let second_pass = if has_indels {
                 let consensus_path = format!("{}/{}.fa", args.output, clean_sample_id(se_read));
                 let (new_index, new_meta) = build_indexes(args.kmer, &[consensus_path]).unwrap_or_else(|e| {
@@ -500,11 +494,8 @@ pub fn call(args: CallArgs) {
                     None => (output, output_rev, output_counts, output_rev_counts, &viral_metadata, best_genome_index, None),
                 };
 
-            // final variants. With a second pass, the first-pass major SNVs are carried over (they were
-            // baked into the consensus, so the second pass no longer re-finds them), but recomputed against
-            // the second-pass pileup so their depth/AF/strand counts reflect the corrected mapping. The
-            // second pass contributes everything else -- minor variants and anything newly callable -- except
-            // where a first-pass major already reports that position. Without a second pass, the first-pass
+            // Print the final variants. First-pass major SNVs are always carried over. If there was a second pass, the
+            // the minor variants and any indels or new SNVs are also carried over and translated position-wise. Without a second pass, the first-pass
             // call is the final result as-is.
             let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
                 let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
@@ -665,14 +656,28 @@ pub fn call(args: CallArgs) {
                 warn!("Percent of kmers found is very low, suggesting a bad reference, a bad sequencing run, contamination in sample, or some other issue")
             }
 
-            // call variants and print them out
+            // call variants for first pass
             let (output, output_rev, output_counts, output_rev_counts)= output_maps.get(&best_genome_index).unwrap_or_else(|| {
                 error!("Failed to find mapping data for selected genome");
                 std::process::exit(1);
             });
 
-            // reconstruct indels and sequence ends unless disabled. Internal indels are reported and
-            // translated as variants; end reconstructions only improve the consensus we re-map to.
+            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
+                &args,
+                output,
+                output_counts,
+                output_rev,
+                output_rev_counts,
+                args.min_af,
+                !args.no_end_filter,
+                !args.no_strand_filter,
+                args.n_per_strand,
+                &best_genome_filename,
+                None, // first pass: original-reference coordinates
+            );
+
+
+            // reconstruct indels and sequence ends unless disabled
             let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
                 info!("Indel reconstruction disabled (--no-indels)");
                 (Vec::new(), Vec::new())
@@ -691,8 +696,6 @@ pub fn call(args: CallArgs) {
                     info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
                 }
 
-                // generalize reconstruction to the sequence ends, for the consensus only (capped at the
-                // reference length; bases the walk can't reach stay as the consensus's N)
                 let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
                 info!("Reconstructed {} sequence end(s) for the consensus", reconstructed_ends.len());
                 for end in &reconstructed_ends {
@@ -702,10 +705,7 @@ pub fn call(args: CallArgs) {
                 (reconstructed_indels, reconstructed_ends)
             };
 
-            // the consensus we re-map to incorporates internal indels and end reconstructions; only the
-            // internal indels are reported/translated as variants. Ends are length-preserving, so the
-            // internal-indel-only coordinate map stays consistent with the spliced consensus. Drop any end
-            // that overlaps an internal indel footprint so the splice and that map stay in agreement.
+            // rebuild a consensus from the indels and ends
             let consensus_edits: Vec<ReconstructedIndel> = reconstructed_indels
                 .iter()
                 .cloned()
@@ -717,33 +717,18 @@ pub fn call(args: CallArgs) {
 
             let has_indels = !consensus_edits.is_empty();
 
-            // first-pass variant call: its major variants seed the consensus, and it is the final result
-            // when no second pass is needed
-            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
-                &args,
-                output,
-                output_counts,
-                output_rev,
-                output_rev_counts,
-                args.min_af,
-                !args.no_end_filter,
-                !args.no_strand_filter,
-                args.n_per_strand,
-                &best_genome_filename,
-                None, // first pass: original-reference coordinates
-            );
+            if !has_indels {
+                info!("No indels or sequence ends were reconstructed, skipping second pass of mapping");
+            } else {
+                info!("Printing reconstructed consensus sequence for sample {} ({} indel/ends)", clean_sample_id(r1), consensus_edits.len());
+            }
 
-            // print consensus (also written whenever there are edits, since we re-index from it): apply the
-            // first-pass called major variants over the reference, then splice in the reconstructed indels/ends
+            // print the sample consensus so we can use it for the second pass (if anything was reconstructed)
             if args.output_consensus || has_indels {
                 print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
             }
 
-            // When indels were reconstructed, the consensus was rewritten with those indels spliced in:
-            // build an index from that corrected consensus and re-map both already-counted kmer sets onto
-            // it (a single genome -> index 0). All downstream output (variant calling, pileup, coverage
-            // stats) then runs against this corrected pass; coord_maps translates each corrected position
-            // back to the original reference so the VCF stays in original-reference coordinates.
+            // Second pass of mapping if reconstructed
             let second_pass = if has_indels {
                 let consensus_path = format!("{}/{}.fa", args.output, clean_sample_id(r1));
                 let (new_index, new_meta) = build_indexes(args.kmer, &[consensus_path]).unwrap_or_else(|e| {
@@ -788,12 +773,9 @@ pub fn call(args: CallArgs) {
                     }
                     None => (output, output_rev, output_counts, output_rev_counts, &viral_metadata, best_genome_index, None),
                 };
-
-            // final variants. With a second pass, the first-pass major SNVs are carried over (they were
-            // baked into the consensus, so the second pass no longer re-finds them), but recomputed against
-            // the second-pass pileup so their depth/AF/strand counts reflect the corrected mapping. The
-            // second pass contributes everything else -- minor variants and anything newly callable -- except
-            // where a first-pass major already reports that position. Without a second pass, the first-pass
+            
+            // Print the final variants. First-pass major SNVs are always carried over. If there was a second pass, the
+            // the minor variants and any indels or new SNVs are also carried over and translated position-wise. Without a second pass, the first-pass
             // call is the final result as-is.
             let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
                 let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
