@@ -2116,10 +2116,19 @@ pub fn map_kmers(
         let mut local_rev_sum: FxHashMap<SeqKey, FxHashMap<usize, [u64; 4]>> = FxHashMap::default();
         let mut local_rev_max: FxHashMap<SeqKey, FxHashMap<usize, [u64; 4]>> = FxHashMap::default();
 
+        let mut local_flanking: FxHashMap<u64, [[u64; 4]; 2]> = FxHashMap::default();
+
         for (kmer, n) in chunk {
 
             let (kmer_bin, rc) = canonical_kmer(kmer.as_bytes(), k);
             let buckets = assign_buckets(kmer_bin, k);
+
+            //record the first and last bucket of the kmer with the base of the first/last character (canonical orientation), depth-weighted by n
+            let rc_idx = rc as usize;
+            let first_base = ((kmer_bin >> (2 * (k - 1))) & 0b11) as usize;
+            let last_base = (kmer_bin & 0b11) as usize;
+            local_flanking.entry(buckets[0]).or_insert([[0u64; 4]; 2])[rc_idx][first_base] += *n;
+            local_flanking.entry(buckets[k - 1]).or_insert([[0u64; 4]; 2])[rc_idx][last_base] += *n;
 
             let filtered_buckets: Vec<u64> = {
                 let (start, end) = if args.use_full_kmer {
