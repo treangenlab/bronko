@@ -70,11 +70,10 @@ fn check_args(args: &BuildArgs) {
         output_level = log::LevelFilter::Info;
     }
 
-    simple_logger::SimpleLogger::new()
-        .with_level(output_level)
-        .init()
-        .unwrap();
-
+    // Log file sits alongside the index output (<output>.log) and mirrors the terminal.
+    let log_path = format!("{}.log", &args.output);
+    init_logging(output_level, Path::new(&log_path));
+    print_banner();
 
     //Check kmer size to make sure it is odd and greater than 3
     if args.kmer % 2 != 1 || args.kmer > MAX_KMER_SIZE || args.kmer < MIN_KMER_SIZE {

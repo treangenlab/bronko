@@ -39,10 +39,10 @@ fn check_args(args: &CallArgs) {
         output_level = log::LevelFilter::Info;
     }
 
-    simple_logger::SimpleLogger::new()
-        .with_level(output_level)
-        .init()
-        .unwrap();
+    // Log file lives inside the run's output folder and mirrors the terminal.
+    let log_path = Path::new(&args.output).join("bronko.log");
+    init_logging(output_level, &log_path);
+    print_banner();
 
     //Check kmer size to make sure it is odd and greater than 3
     if args.kmer % 2 != 1 || args.kmer > MAX_KMER_SIZE || args.kmer < MIN_KMER_SIZE {
@@ -912,14 +912,14 @@ fn cleanup_kmc_files(output_dir: &str, keep_counts: &bool) {
                     || name.ends_with("kmc_suf")
                 {
                     if let Err(e) = fs::remove_file(&path) {
-                        eprintln!("Failed to delete {:?}: {}", path, e);
+                        warn!("Failed to delete {:?}: {}", path, e);
                     }
                 }
 
                 if !keep_counts {
                     if name.ends_with("_counts.txt") {
                         if let Err(e) = fs::remove_file(&path) {
-                            eprintln!("Failed to delete {:?}: {}", path, e);
+                            warn!("Failed to delete {:?}: {}", path, e);
                         }
                     }
                 }
