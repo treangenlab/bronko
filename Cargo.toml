@@ -1,6 +1,6 @@
 [package]
 name = "bronko"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = [
     "Ryan Doughty <rdd4@rice.edu>",
@@ -19,7 +19,7 @@ homepage = "https://github.com/treangenlab/bronko"
 needletail = "0.6.0"
 clap = { version = "4", features = ["derive"] }
 log = "0"
-simple_logger = "3"
+simplelog = "0.12"
 memory-stats = "1.2.0"
 crossbeam-channel = "0.5.15"
 fxhash = "0.2.1"

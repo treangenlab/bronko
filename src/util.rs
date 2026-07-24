@@ -1,7 +1,46 @@
 use memory_stats::memory_stats;
 use std::path::Path;
 use std::fs;
+use std::fs::File;
 use log::*;
+use simplelog::{CombinedLogger, TermLogger, WriteLogger, Config, TerminalMode, ColorChoice};
+
+use crate::consts::BRONKO_VERSION;
+
+/// Initialize logging so that every log is written both to the terminal
+pub fn init_logging(level: log::LevelFilter, log_path: &Path) {
+    // Make sure the directory that will hold the log file exists.
+    if let Some(parent) = log_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).unwrap_or_else(|e| {
+                eprintln!("Unable to create directory for log file {}: {}", parent.display(), e);
+                std::process::exit(1);
+            });
+        }
+    }
+
+    let file = File::create(log_path).unwrap_or_else(|e| {
+        eprintln!("Unable to create log file {}: {}", log_path.display(), e);
+        std::process::exit(1);
+    });
+
+    CombinedLogger::init(vec![
+        // TerminalMode::Stdout keeps every level on stdout, matching the previous
+        // behavior and the "log file == stdout" intent.
+        TermLogger::new(level, Config::default(), TerminalMode::Stdout, ColorChoice::Auto),
+        WriteLogger::new(level, Config::default(), file),
+    ])
+    .unwrap();
+}
+
+/// Emit the bronko startup banner through the logger so it lands in the .log file
+/// as well as the terminal. Must be called after `init_logging`.
+pub fn print_banner() {
+    info!(
+        "bronko v{}\nDeveloped by Ryan Doughty (Rice University)\nCorrespondence: rdd4@rice.edu, treangen@rice.edu\n",
+        BRONKO_VERSION
+    );
+}
 
 
 

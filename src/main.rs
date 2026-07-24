@@ -13,10 +13,7 @@ pub mod build;
 pub mod util;
 
 fn main() {
-    println!("bronko v{}", BRONKO_VERSION);
-    println!("Developed by Ryan Doughty (Rice University)");
-    println!("Correspondence: rdd4@rice.edu, treangen@rice.edu\n");
-
+    // banner is emmitted in both call and build
     let start = Instant::now();
 
     let args = cli::parse_args();
@@ -26,5 +23,5 @@ fn main() {
     }
 
     let end = Instant::now();
-    eprintln!("\nbronko v{} finished in {}s", BRONKO_VERSION, end.duration_since(start).as_secs_f32());
+    log::info!("bronko v{} finished in {}s", BRONKO_VERSION, end.duration_since(start).as_secs_f32());
 }
