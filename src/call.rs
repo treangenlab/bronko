@@ -1504,6 +1504,14 @@ pub fn map_kmers(
     let results: DashMap<u16, (usize, usize, usize)> = DashMap::new();
     
     let chunk_size = if ((kmers.len() / threads) as usize) < 10000 { max(kmers.len() / threads, 100) as usize } else { 10000 };
+
+    let keep_mask: Option<Vec<bool>> = args.specify_pattern.as_ref().map(|sp| {
+        parse_specify_pattern(sp, k).unwrap_or_else(|e| {
+            error!("{}", e);
+            std::process::exit(1);
+        })
+    });
+
     //let keep_mask = bucket_keep_mask(&args.bucket_pattern, args.bucket_stride);
 
     kmers.par_chunks(chunk_size).for_each(|chunk| {
@@ -1523,7 +1531,12 @@ pub fn map_kmers(
             let (kmer_bin, rc) = canonical_kmer(kmer.as_bytes(), k);
             let buckets = assign_buckets(kmer_bin, k);
 
-            let filtered_buckets: Vec<u64> = {
+            let filtered_buckets: Vec<u64> = if let Some(mask) = &keep_mask {
+                buckets.iter().enumerate()
+                    .filter(|(i, _)| mask[*i])
+                    .map(|(_, &b)| b)
+                    .collect()
+            } else {
                 let (start, end) = if args.use_full_kmer {
                     (0, buckets.len())
                 } else {
@@ -1535,7 +1548,6 @@ pub fn map_kmers(
                     }
                 };
                 buckets[start..end].iter().enumerate()
-                    //.filter(|(i, _)| keep_mask[(i + start) % keep_mask.len()])
                     .map(|(_, &b)| b)
                     .collect()
             };
