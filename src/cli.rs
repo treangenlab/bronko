@@ -101,6 +101,9 @@ pub struct CallArgs {
     #[clap(long="n-fixed", default_value_t = DEFAULT_N_FIXED, help_heading="ALGORITHM", help="Number of fixed positions at the end of each kmer that cannot contribute to pileup")]
     pub n_fixed: usize,
 
+    #[clap(long="specify-pattern", help_heading="ALGORITHM", help="Explicit 1/0 keep-mask matching kmer size exactly, e.g. k=15, pattern=\"110000000000001\" -> keeps only the first two and last position. Overrides --n-fixed/--use-full-kmer if set.")]
+    pub specify_pattern: Option<String>,
+
     //VARIANT CALLING PARAMETERS
     //minimum allele frequency to be reported
     #[clap(long="min-af", default_value_t = DEFAULT_MIN_AF, help_heading="VARIANT CALLING PARAMETERS", help="Minimum minor allele frequency to be reported")]
