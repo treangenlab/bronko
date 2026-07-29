@@ -2158,6 +2158,7 @@ pub fn map_kmers(
                     .map(|(_, &b)| b)
                     .collect()
             };
+            
 
             let num_buckets_perfect = filtered_buckets.len();
             let mut per_genome_bucket_hits: FxHashMap<u16, usize> = FxHashMap::default(); //number of hits to each genome (where the key is the index of the file) per kmer
