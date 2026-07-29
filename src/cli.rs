@@ -97,10 +97,11 @@ pub struct CallArgs {
     #[clap(long="use-full-kmer", default_value_t = DEFAULT_USE_FULL_KMER, help_heading="ALGORITHM", help="Use the entire kmer length for variant positions rather than having [--n-fixed] bases on each end")]
     pub use_full_kmer: bool,
 
-    //number of buckets to ignore on ends of kmers 
+    //number of buckets to ignore on ends of kmers  
     #[clap(long="n-fixed", default_value_t = DEFAULT_N_FIXED, help_heading="ALGORITHM", help="Number of fixed positions at the end of each kmer that cannot contribute to pileup")]
     pub n_fixed: usize,
 
+    //specify pattern for position skipping; 1 to include, 0 to skip
     #[clap(long="specify-pattern", help_heading="ALGORITHM", help="Explicit 1/0 keep-mask matching kmer size exactly, e.g. k=15, pattern=\"110000000000001\" -> keeps only the first two and last position. Overrides --n-fixed/--use-full-kmer if set.")]
     pub specify_pattern: Option<String>,
 
