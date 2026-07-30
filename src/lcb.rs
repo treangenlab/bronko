@@ -1,3 +1,5 @@
+use crate::consts::MAX_KMER_SIZE;
+
 pub fn assign_buckets(kmer: u64, k: usize) -> Vec<u64> {
     let mut buckets = [0u64; 32];
     let mut num_a = [0u64; 32];
@@ -43,6 +45,8 @@ pub fn assign_buckets(kmer: u64, k: usize) -> Vec<u64> {
 
     buckets[..k].to_vec()
 }
+
+
 
 pub fn nt_to_bits(nt: u8) -> u8 {
     match nt {
@@ -136,7 +140,6 @@ pub fn seq_to_canon_kmers(seq: Vec<u8>, k: usize) -> Vec<(u64, bool)> {
 
     results
 }
-
 
 #[cfg(test)]
 mod tests {
