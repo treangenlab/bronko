@@ -27,8 +27,6 @@ use std::cmp::max;
 
 use statrs::distribution::{StudentsT, ContinuousCDF};
 
-
-
 fn check_args(args: &CallArgs) {
     let output_level;
     if args.verbose {
@@ -48,6 +46,25 @@ fn check_args(args: &CallArgs) {
     if args.kmer % 2 != 1 || args.kmer > MAX_KMER_SIZE || args.kmer < MIN_KMER_SIZE {
         error!("Invalid kmer size, must be odd and between [{}-{}]", MIN_KMER_SIZE, MAX_KMER_SIZE);
         std::process::exit(1)
+    }
+
+    //the bucket filter is a 1/0 mask over the kmer, so it must line up with the kmer size and keep something
+    if let Some(bucket_filter) = &args.bucket_filter {
+        if bucket_filter.len() != args.kmer {
+            error!("--bucket-filter length ({}) must exactly match --kmer-size ({})", bucket_filter.len(), args.kmer);
+            std::process::exit(1);
+        }
+        if !bucket_filter.chars().all(|c| c == '0' || c == '1') {
+            error!("--bucket-filter must contain only '0' and '1': {}", bucket_filter);
+            std::process::exit(1);
+        }
+        if !bucket_filter.contains('1') {
+            error!("--bucket-filter must keep at least one position (no '1' present): {}", bucket_filter);
+            std::process::exit(1);
+        }
+        if args.n_fixed != 0 || args.use_full_kmer != DEFAULT_USE_FULL_KMER {
+            warn!("--bucket-filter was provided, the mask will be used and --n-fixed/--use-full-kmer will be ignored");
+        }
     }
 
     //check to see if inputs are valid fastq and fasta files
@@ -2102,7 +2119,9 @@ pub fn map_kmers(
     let results: DashMap<u16, (usize, usize, usize)> = DashMap::new();
     
     let chunk_size = if ((kmers.len() / threads) as usize) < 10000 { max(kmers.len() / threads, 100) as usize } else { 10000 };
-    //let keep_mask = bucket_keep_mask(&args.bucket_pattern, args.bucket_stride);
+
+    //validated in check_args, so this is just the string -> per-position keep flag conversion
+    let keep_mask: Option<Vec<bool>> = args.bucket_filter.as_ref().map(|bf| parse_bucket_filter(bf));
 
     kmers.par_chunks(chunk_size).for_each(|chunk| {
 
@@ -2130,7 +2149,12 @@ pub fn map_kmers(
             local_flanking.entry(buckets[0]).or_insert([[0u64; 4]; 2])[rc_idx][first_base] += *n;
             local_flanking.entry(buckets[k - 1]).or_insert([[0u64; 4]; 2])[rc_idx][last_base] += *n;
 
-            let filtered_buckets: Vec<u64> = {
+            let filtered_buckets: Vec<u64> = if let Some(mask) = &keep_mask {
+                buckets.iter().enumerate()
+                    .filter(|(i, _)| mask[*i])
+                    .map(|(_, &b)| b)
+                    .collect()
+            } else {
                 let (start, end) = if args.use_full_kmer {
                     (0, buckets.len())
                 } else {
@@ -2142,10 +2166,10 @@ pub fn map_kmers(
                     }
                 };
                 buckets[start..end].iter().enumerate()
-                    //.filter(|(i, _)| keep_mask[(i + start) % keep_mask.len()])
                     .map(|(_, &b)| b)
                     .collect()
             };
+            
 
             let num_buckets_perfect = filtered_buckets.len();
             let mut per_genome_bucket_hits: FxHashMap<u16, usize> = FxHashMap::default(); //number of hits to each genome (where the key is the index of the file) per kmer

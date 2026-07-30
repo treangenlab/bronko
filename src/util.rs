@@ -77,6 +77,13 @@ pub fn check_txt(file: &str) -> bool {
     return false;
 }
 
+/// Turn a --bucket-filter mask into a per-position keep flag, where '1' keeps the
+/// bucket at that offset in the kmer and '0' skips it. The mask is validated in
+/// check_args, so anything other than '1' is treated as a skip here.
+pub fn parse_bucket_filter(pattern: &str) -> Vec<bool> {
+    pattern.chars().map(|c| c == '1').collect()
+}
+
 pub fn clean_sample_id<P: AsRef<Path>>(path: P) -> String {
     let filename = path.as_ref().file_name()
         .and_then(|s| s.to_str())
