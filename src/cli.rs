@@ -102,8 +102,8 @@ pub struct CallArgs {
     pub n_fixed: usize,
 
     //specify pattern for position skipping; 1 to include, 0 to skip
-    #[clap(long="specify-pattern", help_heading="ALGORITHM", help="Explicit 1/0 keep-mask matching kmer size exactly, e.g. k=15, pattern=\"110000000000001\" -> keeps only the first two and last position. Overrides --n-fixed/--use-full-kmer if set.")]
-    pub specify_pattern: Option<String>,
+    #[clap(long="bucket-filter", help_heading="ALGORITHM", help="Explicit 1/0 mask matching kmer size exactly, e.g. k=15, pattern=\"100000010000001\" -> keeps only the first, last, and middle positions. Overrides --n-fixed/--use-full-kmer if set.")]
+    pub bucket_filter: Option<String>,
 
     //VARIANT CALLING PARAMETERS
     //minimum allele frequency to be reported

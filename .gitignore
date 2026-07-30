@@ -1,21 +1,6 @@
 /target
 /.vscode
-/test_data
-/test_outputs
-/investigations
-/out
-/tmp
-/rust_test1
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target
-
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target
+iv.py
+/*.bkdb
+/releases
+/dev-tests
