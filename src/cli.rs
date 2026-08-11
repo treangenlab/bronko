@@ -23,6 +23,7 @@ pub struct Cli {
 pub enum Mode {
     Build(BuildArgs), //Build --> parses a genome(s) and builds the data strucutre that we want to map to later
     Call(CallArgs), //Call --> takes the genomes and sequencing data and does the viral variation analysis
+    Align(AlignArgs), //Align --> takes genomes and builds a reference-free alignment using buckets alone
 }
 
 #[derive(Args, Default)]
@@ -130,8 +131,12 @@ pub struct CallArgs {
     #[clap(long="n-per-strand", default_value_t = DEFAULT_N_KMERS_PER_STRAND, help_heading="VARIANT CALLING PARAMETERS", help="Min number of unique kmers to observe to call a variant at any site (needed on both strands if strand filter active)")]
     pub n_per_strand: usize,
 
-    #[clap(long="strand_odds", default_value_t = DEFAULT_MAX_STRAND_ODDS, help_heading="VARIANT CALLING PARAMETERS", help="Maximum strand odds ratio for a variant to pass strand filtering")]
+    #[clap(long="strand_odds", default_value_t = DEFAULT_MAX_STRAND_ODDS, help_heading="VARIANT CALLING PARAMETERS", help="Maximum strand odds ratio for a variant to pass strand filtering (the floor of the allowed SOR, see --strand-odds-gain)")]
     pub strand_odds_max: f64,
+
+    //how fast the allowed strand odds ratio grows with the evidence behind a variant
+    #[clap(long="strand-odds-gain", default_value_t = DEFAULT_STRAND_ODDS_GAIN, help_heading="VARIANT CALLING PARAMETERS", help="How much the allowed strand odds ratio grows per 10x of reads supporting a variant, for a variant sitting a decade above the local noise floor. The allowance starts at --strand_odds (a variant at the noise floor gets no more than that, however deep the site) and is capped at twice it. Note this scales off the same noise estimate as --noise-multiplier, so raising that also tightens strand filtering. 0 = fixed --strand_odds cutoff (pre-1.x behaviour)")]
+    pub strand_odds_gain: f64,
 
     //min depth to call a variant
     #[clap(long="min-depth", default_value_t = DEFAULT_MIN_DEPTH, help_heading="VARIANT CALLING PARAMETERS", help="Minimum total depth at an allele to call a minor variant (default=100*min_kmers)")]
@@ -147,8 +152,8 @@ pub struct CallArgs {
 
     //INDEL PARAMETERS
     //disable indel reconstruction entirely (consensus will not contain indels)
-    #[clap(long="no-indels", default_value_t = DEFAULT_NO_INDELS, help_heading="INDEL DETECTION", help="Disable indel detection and reconstruction (the consensus sequence will not contain indels)")]
-    pub no_indels: bool,
+    #[clap(long="indels", default_value_t = DEFAULT_INDEL_DETECTION, help_heading="INDEL DETECTION", help="Enable indel detection and reconstruction (the consensus sequence will not contain indels)")]
+    pub indel_detection: bool,
 
     //max ratio of low/high total depth between neighbors to flag a breakpoint
     #[clap(long="indel-max-ratio", default_value_t = DEFAULT_INDEL_MAX_RATIO, help_heading="INDEL DETECTION", help="Flag an indel breakpoint when min/max total depth between two neighboring positions falls below this ratio (a sharp coverage cliff)")]
@@ -185,6 +190,32 @@ pub struct CallArgs {
     pub output_consensus: bool,
 
     // OTHER PARAMETERS
+    //Number of threads
+    #[clap(short, long="threads", default_value_t=4, help="Number of threads")]
+    pub threads: usize,
+
+    //Debug mode
+    #[clap(long = "debug", help = "Debug output")]
+    pub debug: bool,
+
+    //Verbose mode (prints most checkpoints)
+    #[clap(long = "verbose", help = "Verbose output (warning: very verbose)")]
+    pub verbose: bool,
+}
+
+#[derive(Args)]
+#[clap(about="Align reference genomes without the use of formal MSA", arg_required_else_help = true)]
+pub struct AlignArgs {
+
+    // INPUT
+    #[clap(num_args=1.., short='g', long = "genomes", help_heading = "INPUT", help = "Genome fasta(.gz) files to use as references (bronko build will be called)")]
+    pub genomes: Vec<String>,
+
+    // ALGORITHM PARAMETERS
+    // the kmer size
+    #[clap(short, long="kmer-size", default_value_t = DEFAULT_KMER_SIZE, help_heading="ALGORITHM", help="Kmer size used for analysis")]
+    pub kmer: usize,
+
     //Number of threads
     #[clap(short, long="threads", default_value_t=4, help="Number of threads")]
     pub threads: usize,

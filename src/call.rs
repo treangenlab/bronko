@@ -143,6 +143,13 @@ fn check_args(args: &CallArgs) {
         warn!("Strand balance ratio is set to 1, all variants will pass this filter");
     }
 
+    if args.strand_odds_gain < 0.0 {
+        error!("Strand odds gain is set to below 0, must be 0.0 (fixed cutoff) or greater");
+        std::process::exit(1);
+    } else if args.strand_odds_gain == 0.0 {
+        info!("Strand odds gain set to 0, strand filtering uses a fixed cutoff of {}", args.strand_odds_max);
+    }
+
     if args.min_variant_depth < 0 {
         warn!("Minimum variant depth set below 0, all variants will be returned if passing other thresholds");
     }
@@ -418,7 +425,7 @@ pub fn call(args: CallArgs) {
 
 
             // reconstruct indels and sequence ends unless disabled
-            let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
+            let (reconstructed_indels, reconstructed_ends) = if !args.indel_detection {
                 info!("Indel reconstruction disabled (--no-indels)");
                 (Vec::new(), Vec::new())
             } else {
@@ -695,7 +702,7 @@ pub fn call(args: CallArgs) {
 
 
             // reconstruct indels and sequence ends unless disabled
-            let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
+            let (reconstructed_indels, reconstructed_ends) = if !args.indel_detection {
                 info!("Indel reconstruction disabled (--no-indels)");
                 (Vec::new(), Vec::new())
             } else {
@@ -1364,7 +1371,8 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Total Depth\">").unwrap();
     writeln!(writer, "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">").unwrap();
     writeln!(writer, "##INFO=<ID=DP4,Number=4,Type=Integer,Description=\"Fwd_ref,Rev_ref,Fwd_alt,Rev_alt\">").unwrap();
-    writeln!(writer, "##INFO=<ID=SOR,Number=4,Type=Float,Description=\"SOR\">").unwrap();
+    writeln!(writer, "##INFO=<ID=SOR,Number=1,Type=Float,Description=\"SOR\">").unwrap();
+    writeln!(writer, "##INFO=<ID=SORMAX,Number=1,Type=Float,Description=\"Maximum SOR this variant was allowed, scaled by its read support and distance above the local noise floor (-1 if no strand test applied)\">").unwrap();
     writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, MNV, INS, DEL)\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
@@ -1385,7 +1393,7 @@ pub fn print_output(
 
     for variant in sorted{
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
-        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};TYPE={}",
+        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};SORMAX={:.3};TYPE={}",
             seq_out,
             variant.pos,
             String::from_utf8_lossy(&variant.ref_allele),
@@ -1394,6 +1402,7 @@ pub fn print_output(
             variant.af,
             variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt,
             variant.sor,
+            variant.sor_max,
             variant.var_type()
         ).unwrap()
     }
@@ -1411,7 +1420,8 @@ pub struct VCFRecord{
     rev_alt: u64,
     depth: u64,
     af: f64,
-    sor: f64
+    sor: f64,
+    sor_max: f64 // the SOR cutoff actually applied to this variant (-1.0 where no strand test runs)
 }
 
 impl VCFRecord {
@@ -1427,15 +1437,7 @@ impl VCFRecord {
     }
 }
 
-// Build a VCF record for a reconstructed indel. REF is the original-reference footprint the allele
-// replaced and ALT is the reconstructed allele. The two alleles drop out of opposite pileups, so each
-// is measured where it maps cleanly: the REF allele (reads without the indel) from the first-pass
-// pileup over the disrupted footprint, and the ALT allele (reads with the indel) from the second-pass
-// (corrected consensus) pileup over the spliced-in allele. Each side takes the weakest (minimum total
-// depth) position across its span, which lands in the disrupted region rather than the well-covered
-// anchors. Those per-strand counts give DP4, AF, DP and the strand odds ratio. The shared flanks are
-// then trimmed to a single anchor base and the start is reported in the original reference. Returns
-// None if the indel can't be located/translated (e.g. footprint out of range or abutting another indel).
+// Build a VCF record for a reconstructed indel. 
 fn indel_to_vcf_record(
     indel: &ReconstructedIndel,
     orig_output: &DashMap<String, OutputData>,
@@ -1543,6 +1545,7 @@ fn indel_to_vcf_record(
         depth,
         af,
         sor,
+        sor_max: -1.0, // indels are not strand filtered
     })
 }
 
@@ -1559,7 +1562,7 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
     //window size and alppa, max table size for our streaming version of thompson tau
     let window_size = 100;
     let alpha = 0.001;
-    let max_table_len = window_size / 10;
+    let max_table_len = window_size / 5;
 
     let len = fwd.counts.len();
     
@@ -1691,7 +1694,7 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             // if not, set the baseline noise at i to curr_mu, curr_var, curr_max
             if (candidate_outlier as f64 - curr_mu).abs() > tau * std {
                 curr_s -= candidate_outlier;
-                curr_s2 -= candidate_outlier;
+                curr_s2 -=  candidate_outlier * candidate_outlier;
                 curr_n -= 1;
                 if curr_n > 0 {
                     curr_mu = curr_s as f64 / curr_n as f64;
@@ -1712,7 +1715,7 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             let write_idx = i - half_window;
             if write_idx < len {
                 baseline_noise[write_idx] = Noise{
-                    max: maxes[curr_max_idx],
+                    max: maxes.get(curr_max_idx).copied().unwrap_or(0.0),
                     mean: curr_mu,
                     std: curr_var.sqrt()
                 };
@@ -1782,6 +1785,7 @@ fn major_snv_second_pass_record(
         depth: total_depth,
         af,
         sor,
+        sor_max: -1.0, // major variants are not strand filtered
     })
 }
 
@@ -1820,10 +1824,6 @@ pub fn call_variants(
         let rev_counts = output_rev_count.get(seq).expect("Missing rev counts");
 
         let baseline_noise: Vec<Noise> = get_baseline_noise(&*fwd, &*rev);
-
-        // for i in 100..120 {
-        //     info!("{}", baseline_noise[i].mean);
-        // }
 
         let len = fwd.counts.len();
         let mut start = 0;
@@ -1887,6 +1887,28 @@ pub fn call_variants(
                     continue;
                 }
 
+                //Compute af and minor noise multiplier threshold for future use
+                let alt_count = row_total[alt_base as usize];
+                let af = alt_count as f64 / total_depth as f64;
+
+                let y0: f64 = args.variant_multiplier;
+                let p0: f64 = 0.5;
+                let decay: f64 = 0.03;
+                let factor = y0 + p0 * decay.powf(100.0 * af);
+                let noise_threshold = factor.max(y0) * baseline_noise[i].max;
+
+
+                // The intution behind this is how much strand skew the variant is allowed to carry. You have more
+                // confidence in a variant with a ton of read support even if it is skewed to one strand. Combine the noise
+                // threshold with strand bias and the depth
+                let mut sor_max = args.strand_odds_max;
+                if args.strand_odds_gain > 0.0 && noise_threshold > 0.0 && af > noise_threshold {
+                    let above_noise = (af / noise_threshold).log10().clamp(0.0, 1.0);
+                    let support = (alt_count as f64 / MIN_KMER_COUNT as f64).max(1.0).log10();
+                    sor_max = (args.strand_odds_max + args.strand_odds_gain * support * above_noise)
+                        .min(2.0 * args.strand_odds_max);
+                }
+
                 // NEW Strand filter logic
                 let mut sor = args.strand_odds_max + 1.0; //default is above the given so filtered if not able to calculate
                 if strand_filter {
@@ -1900,15 +1922,15 @@ pub fn call_variants(
                     let min_strand_depth = (a+c).min(b+d);
                     let min_strand_percent = min_strand_depth / ref_total;
 
-                    //if the strand balance filter is on (default), then always do SOR filter
-                    //if the strand balance filter is off, then only do SOR filter when 1 strand is > strand_balance_ratio of total depth (by default 10% of total depth, aka all cases where 1 strand is less than 10% of the total depth are ignored)
-                    if (!args.no_strand_balance_filter) | ((args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) {
+                    //if the strand balance filter is off, then always do SOR filter
+                    //if the strand balance filter is on (default), then only do SOR filter when 1 strand is > strand_balance_ratio of total depth (by default 10% of total depth, aka all cases where 1 strand is less than 10% of the total depth are ignored)
+                    if (args.no_strand_balance_filter) | ((!args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) {
 
                         //Using GATK strand odds ratio
                         sor = strand_odds_ratio(row[ref_base as usize], row_rev[ref_base as usize], row[alt_base as usize], row_rev[alt_base as usize]);
 
-                        // filter out if greater than strand odds ratio (default 8)
-                        if sor > args.strand_odds_max {
+                        // filter out if greater than the strand odds ratio this variant has earned
+                        if sor > sor_max {
                             continue;
                         }
 
@@ -1924,16 +1946,8 @@ pub fn call_variants(
                     }
                 }
 
-                //Get minor af (filter out if below reporting threshold)
-                let alt_count = row_total[alt_base as usize];
-                let af = alt_count as f64 / total_depth as f64;
-                
-                let y0: f64 = args.variant_multiplier;
-                let p0: f64 = 0.5;
-                let a: f64 = 0.03;
-                let factor = y0 + p0 * a.powf(100.0 * af);
-
-                if af < min_af || af < (factor.max(y0) * baseline_noise[i].max) {
+                //filter out if below the reporting threshold or inside the local noise
+                if af < min_af || af < noise_threshold {
                     continue;
                 }
 
@@ -1962,7 +1976,8 @@ pub fn call_variants(
                     rev_alt: row_rev[alt_base as usize],
                     depth: total_depth,
                     af: af,
-                    sor: sor
+                    sor: sor,
+                    sor_max: if strand_filter { sor_max } else { -1.0 }
                 })
 
             }
@@ -2162,7 +2177,7 @@ pub fn map_kmers(
                     if args.n_fixed * 2 + 1 >= len {
                         (0, 0)
                     } else {
-                        (args.n_fixed, len - args.n_fixed - 1)
+                        (args.n_fixed, len - args.n_fixed)
                     }
                 };
                 buckets[start..end].iter().enumerate()
@@ -2185,13 +2200,14 @@ pub fn map_kmers(
 
                         let genome_pos = info.location as usize;
                         let nuc_x = info.idx as usize;
-                        let idx = genome_pos + nuc_x;
+                        // let idx = genome_pos + nuc_x;
+                        let idx = genome_pos + (if info.canonical { k - nuc_x - 1 } else { nuc_x });
                         let key: SeqKey = (info.file_id, info.seq_id);
 
-                        if info.canonical {
-                            // pos = k - nuc_x - 1, so k - pos - 1 = nuc_x
-                            let bit_idx = (((kmer_bin >> (2 * nuc_x)) & 0b11) ^ 0b11) as usize;
-                            if rc {
+                        if info.canonical { //if the reference kmer is represented canonically 
+                            // canonical index nuc_x is forward offset k-nuc_x-1, complemented; idx mirrors to match
+                            let bit_idx = (((kmer_bin >> (2 * (k - nuc_x - 1))) & 0b11) ^ 0b11) as usize; //extracts the reverse complement of the base at position nuc_x
+                            if rc { //if the query kmer is reverse complemented
                                 local_fwd_sum.entry(key).or_default().entry(idx).or_insert([0u64; 4])[bit_idx] += 1;
                                 let e = local_fwd_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
                                 if e[bit_idx] < *n { e[bit_idx] = *n; }
@@ -2200,10 +2216,10 @@ pub fn map_kmers(
                                 let e = local_rev_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
                                 if e[bit_idx] < *n { e[bit_idx] = *n; }
                             }
-                        } else {
+                        } else { //if the reference kmer is represented as itself (not canonically)
                             // pos = nuc_x, so k - pos - 1 = k - nuc_x - 1
-                            let bit_idx = ((kmer_bin >> (2 * (k - nuc_x - 1))) & 0b11) as usize;
-                            if rc {
+                            let bit_idx = ((kmer_bin >> (2 * (k - nuc_x - 1))) & 0b11) as usize; //extracts the base at position nuc_x
+                            if rc { //if the query kmer is reverse complemented
                                 local_rev_sum.entry(key).or_default().entry(idx).or_insert([0u64; 4])[bit_idx] += 1;
                                 let e = local_rev_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
                                 if e[bit_idx] < *n { e[bit_idx] = *n; }
