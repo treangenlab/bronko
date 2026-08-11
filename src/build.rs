@@ -17,6 +17,7 @@ use std::fs::File;
 use std::fs;
 
 use std::io::{BufRead,BufReader,BufWriter};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
@@ -219,14 +220,15 @@ pub fn build_indexes(
 ) -> Result<(FxHashMap<u64, Vec<BucketInfo>>, ViralMetadata), Error> {
     info!("Building indexes from fasta files");
 
+    // buckets discarded for being ambiguous within a single genome (see the retain() below)
+    let ambiguous_dropped = AtomicUsize::new(0);
+
     // use map - reduce framework from rayon to process and integrate all files into single index
     let (global_index, all_files) = genomes
         .par_iter()
         .enumerate()
         .map(|(file_id, file_path)| {
             trace!("{}: {}", file_id, file_path);
-            let mut local_index: FxHashMap<u64, Vec<BucketInfo>> = FxHashMap::default();
-            let mut sequences: Vec<SeqMeta> = Vec::new();
 
             let mut reader = parse_fastx_file(file_path).unwrap_or_else(|e| {
                 error!("{} | Failed to parse fasta file: {}", e, file_path);
@@ -289,6 +291,11 @@ pub fn build_indexes(
                 sequences,
             };
 
+            // Drop buckets occurring more than once within this genome. 
+            let before = local_index.len();
+            local_index.retain(|_, entries| entries.len() == 1);
+            ambiguous_dropped.fetch_add(before - local_index.len(), Ordering::Relaxed);
+
             (local_index, vec![file_meta])
         })
         .reduce(
@@ -306,6 +313,11 @@ pub fn build_indexes(
                 (map_a, files_a)
             }
         );
+
+    let n_ambiguous = ambiguous_dropped.load(Ordering::Relaxed);
+    if n_ambiguous > 0 {
+        info!("Dropped {} ambiguous buckets (occurring more than once within a genome)", n_ambiguous);
+    }
 
     Ok((global_index, ViralMetadata { files: all_files, k}))
 }
