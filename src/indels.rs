@@ -481,6 +481,11 @@ pub fn reconstruct_indels(
             let left_kmer = &ref_bases[left_start..=left_end];
             let right_kmer = &ref_bases[right_start..=right_end];
 
+            // anchors spanning ambiguous bases cannot be encoded, so skip the event
+            if !is_acgt(left_kmer) || !is_acgt(right_kmer) {
+                continue;
+            }
+
             trace!(
                 "reconstructing indel between drop at {} and rise at {} on sequence {} with left k-mer {} and right k-mer {}",
                 left_end + 1, //1-based
@@ -612,7 +617,7 @@ pub fn reconstruct_ends(
         });
         if let Some(anchor_start) = anchor_start_5 {
             let anchor_end = anchor_start + k - 1; // 0-based last base
-            if anchor_end < len {
+            if anchor_end < len && is_acgt(&ref_bases[anchor_start..=anchor_end]) {
                 let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
                 // walk left at most `anchor_start` bases (reaching position 0 = the reference start)
                 let head = reconstruct_end(anchor_kmer, false, anchor_start, k, flanking_base_map);
@@ -647,7 +652,7 @@ pub fn reconstruct_ends(
         });
         if let Some(anchor_start) = anchor_start_3 {
             let anchor_end = anchor_start + k - 1; // 0-based last base
-            if anchor_end < len {
+            if anchor_end < len && is_acgt(&ref_bases[anchor_start..=anchor_end]) {
                 let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
                 let max_ext = (len - 1) - anchor_end; // reach the last reference position at most
                 let tail = reconstruct_end(anchor_kmer, true, max_ext, k, flanking_base_map);

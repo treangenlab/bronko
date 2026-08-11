@@ -1457,6 +1457,9 @@ fn indel_to_vcf_record(
             return None;
         }
         let ref_allele = orig.ref_bases[indel.ref_start - 1..indel.ref_end].to_vec();
+        if !is_acgt(&ref_allele) {
+            return None;
+        }
 
         let mut rep = indel.ref_start - 1;
         let mut min_total = u64::MAX;
@@ -1485,6 +1488,9 @@ fn indel_to_vcf_record(
         let rev = new_output_rev.get(&indel.seq)?;
         let c_end = (c_start + indel.allele.len()).min(fwd.counts.len());
         if c_start >= c_end {
+            return None;
+        }
+        if !is_acgt(&fwd.ref_bases[c_start..c_end]) {
             return None;
         }
         let mut rep = c_start;

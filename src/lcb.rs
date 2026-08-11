@@ -48,14 +48,19 @@ pub fn assign_buckets(kmer: u64, k: usize) -> Vec<u64> {
 
 
 
+// 4 = non-ACGT. Ambiguous regions are filtered out at indexing and variant calling.
 pub fn nt_to_bits(nt: u8) -> u8 {
     match nt {
         b'A' | b'a' => 0,
         b'C' | b'c' => 1,
         b'G' | b'g' => 2,
         b'T' | b't' => 3,
-        _ => 0, // todo: handle other bases
+        _ => 4,
     }
+}
+
+pub fn is_acgt(seq: &[u8]) -> bool {
+    seq.iter().all(|&b| nt_to_bits(b) < 4)
 }
 
 pub fn nucleotide_bits_to_char(bits: u64) -> char {

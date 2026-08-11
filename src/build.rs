@@ -222,6 +222,8 @@ pub fn build_indexes(
 
     // buckets discarded for being ambiguous within a single genome (see the retain() below)
     let ambiguous_dropped = AtomicUsize::new(0);
+    // windows skipped for containing non-ACGT bases
+    let ambiguous_skipped = AtomicUsize::new(0);
 
     // use map - reduce framework from rayon to process and integrate all files into single index
     let (global_index, all_files) = genomes
@@ -268,6 +270,13 @@ pub fn build_indexes(
                 if seq_len >= k {
                     for i in 0..=seq_len.saturating_sub(k) {
                         let kmer = &seq[i..i + k];
+
+                        // N has no 2-bit encoding; indexing it anyway encoded every N as an A
+                        if !is_acgt(kmer) {
+                            ambiguous_skipped.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
                         let (kmer_bin, canonical) = canonical_kmer(kmer, k);
                         let buckets = assign_buckets(kmer_bin, k);
 
@@ -317,6 +326,11 @@ pub fn build_indexes(
     let n_ambiguous = ambiguous_dropped.load(Ordering::Relaxed);
     if n_ambiguous > 0 {
         info!("Dropped {} ambiguous buckets (occurring more than once within a genome)", n_ambiguous);
+    }
+
+    let n_skipped = ambiguous_skipped.load(Ordering::Relaxed);
+    if n_skipped > 0 {
+        info!("Skipped {} kmers containing ambiguous bases", n_skipped);
     }
 
     Ok((global_index, ViralMetadata { files: all_files, k}))
