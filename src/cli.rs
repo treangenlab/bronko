@@ -131,12 +131,12 @@ pub struct CallArgs {
     #[clap(long="n-per-strand", default_value_t = DEFAULT_N_KMERS_PER_STRAND, help_heading="VARIANT CALLING PARAMETERS", help="Min number of unique kmers to observe to call a variant at any site (needed on both strands if strand filter active)")]
     pub n_per_strand: usize,
 
-    #[clap(long="strand_odds", default_value_t = DEFAULT_MAX_STRAND_ODDS, help_heading="VARIANT CALLING PARAMETERS", help="Maximum strand odds ratio for a variant to pass strand filtering (the floor of the allowed SOR, see --strand-odds-gain)")]
+    #[clap(long="strand_odds", default_value_t = DEFAULT_MAX_STRAND_ODDS, help_heading="VARIANT CALLING PARAMETERS", help="Maximum strand odds ratio for a variant to pass strand filtering, tested against SOR_adjusted (see --sor-adj-multiplier)")]
     pub strand_odds_max: f64,
 
     //how fast the allowed strand odds ratio grows with the evidence behind a variant
-    #[clap(long="strand-odds-gain", default_value_t = DEFAULT_STRAND_ODDS_GAIN, help_heading="VARIANT CALLING PARAMETERS", help="How much the allowed strand odds ratio grows per 10x of reads supporting a variant, for a variant sitting a decade above the local noise floor. The allowance starts at --strand_odds (a variant at the noise floor gets no more than that, however deep the site) and is capped at twice it. Note this scales off the same noise estimate as --noise-multiplier, so raising that also tightens strand filtering. 0 = fixed --strand_odds cutoff (pre-1.x behaviour)")]
-    pub strand_odds_gain: f64,
+    #[clap(long="sor-adj-multiplier", default_value_t = DEFAULT_SOR_ADJ_MULTIPLIER, help_heading="VARIANT CALLING PARAMETERS", help="How much a variant's strand odds ratio is discounted with 10x of reads supporting it, for a variant sitting a decade above the local noise floor (see docs for full details))")]
+    pub sor_adj_multiplier: f64,
 
     //min depth to call a variant
     #[clap(long="min-depth", default_value_t = DEFAULT_MIN_DEPTH, help_heading="VARIANT CALLING PARAMETERS", help="Minimum total depth at an allele to call a minor variant (default=100*min_kmers)")]

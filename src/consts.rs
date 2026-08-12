@@ -10,7 +10,7 @@ pub const DEFAULT_NO_STRAND_BALANCE_FILTER: bool = false; //do not filter varian
 pub const DEFAULT_STRAND_BALANCE_RATIO: f64 = 0.3; //percent of total depth that one strand must be under to be called unbalanced and therefore bypass SOR
 pub const DEFAULT_N_KMERS_PER_STRAND: usize = 2;  //number of kmers that are needed to support each strand to call a variant
 pub const DEFAULT_MAX_STRAND_ODDS: f64 = 8.0; // Strand odds ratio that must be under
-pub const DEFAULT_STRAND_ODDS_GAIN: f64 = 4.0; //how much the max strand odds ratio grows per decade of read support, at a variant sitting a decade above the local noise floor (0 = fixed cutoff, capped at 2x max strand odds)
+pub const DEFAULT_SOR_ADJ_MULTIPLIER: f64 = 3.0; //how much SOR is discounted per decade of read support, at a variant a decade above the local noise floor (0 = no adjustment, capped at the strand odds cutoff)
 pub const DEFAULT_NOISE_MULTIPLIER: f64 = 2.0; //How much variant must be above baseline noise (with exponential increase below 1% (going up to + 0.3 higher))
 pub const DEFAULT_TSV_PILEUP: bool = false; //print a pileup as well
 pub const DEFAULT_ALIGNMENT: bool = false; // return an alignment

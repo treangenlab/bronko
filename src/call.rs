@@ -143,11 +143,11 @@ fn check_args(args: &CallArgs) {
         warn!("Strand balance ratio is set to 1, all variants will pass this filter");
     }
 
-    if args.strand_odds_gain < 0.0 {
-        error!("Strand odds gain is set to below 0, must be 0.0 (fixed cutoff) or greater");
+    if args.sor_adj_multiplier < 0.0 {
+        error!("SOR adjustment multiplier is set to below 0, must be 0.0 (no adjustment) or greater");
         std::process::exit(1);
-    } else if args.strand_odds_gain == 0.0 {
-        info!("Strand odds gain set to 0, strand filtering uses a fixed cutoff of {}", args.strand_odds_max);
+    } else if args.sor_adj_multiplier == 0.0 {
+        info!("SOR adjustment multiplier set to 0, strand filtering uses a fixed cutoff of {}", args.strand_odds_max);
     }
 
     if args.min_variant_depth < 0 {
@@ -1410,7 +1410,7 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">").unwrap();
     writeln!(writer, "##INFO=<ID=DP4,Number=4,Type=Integer,Description=\"Fwd_ref,Rev_ref,Fwd_alt,Rev_alt\">").unwrap();
     writeln!(writer, "##INFO=<ID=SOR,Number=1,Type=Float,Description=\"SOR\">").unwrap();
-    writeln!(writer, "##INFO=<ID=SORMAX,Number=1,Type=Float,Description=\"SOR scaled by read support and distance from noise floor\">").unwrap();
+    writeln!(writer, "##INFO=<ID=SOR_ADJ,Number=1,Type=Float,Description=\"SOR discounted by read support and distance from the noise floor\">").unwrap();
     writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, INS, DEL)\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
@@ -1431,7 +1431,7 @@ pub fn print_output(
 
     for variant in sorted{
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
-        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};SORMAX={:.3};TYPE={}",
+        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};SOR_ADJ={:.3};TYPE={}",
             seq_out,
             variant.pos,
             String::from_utf8_lossy(&variant.ref_allele),
@@ -1440,7 +1440,7 @@ pub fn print_output(
             variant.af,
             variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt,
             variant.sor,
-            variant.sor_max,
+            variant.sor_adjusted,
             variant.var_type()
         ).unwrap()
     }
@@ -1459,7 +1459,7 @@ pub struct VCFRecord{
     depth: u64,
     af: f64,
     sor: f64,
-    sor_max: f64 // the SOR cutoff actually applied to this variant (-1.0 where no strand test runs)
+    sor_adjusted: f64 // SOR after its evidence discount, the value tested against the cutoff (-1.0 where no strand test runs)
 }
 
 impl VCFRecord {
@@ -1589,7 +1589,7 @@ fn indel_to_vcf_record(
         depth,
         af,
         sor,
-        sor_max: -1.0, // indels are not strand filtered
+        sor_adjusted: -1.0, // indels are not strand filtered
     })
 }
 
@@ -1629,7 +1629,7 @@ fn split_block_substitution(
             depth: rec.depth,
             af: rec.af,
             sor: rec.sor,
-            sor_max: rec.sor_max,
+            sor_adjusted: rec.sor_adjusted,
         }));
     }
     out
@@ -1871,7 +1871,7 @@ fn major_snv_second_pass_record(
         depth: total_depth,
         af,
         sor,
-        sor_max: -1.0, // major variants are not strand filtered
+        sor_adjusted: -1.0, // major variants are not strand filtered
     })
 }
 
@@ -1984,19 +1984,20 @@ pub fn call_variants(
                 let noise_threshold = factor.max(y0) * baseline_noise[i].max;
 
 
-                // The intution behind this is how much strand skew the variant is allowed to carry. You have more
-                // confidence in a variant with a ton of read support even if it is skewed to one strand. Combine the noise
-                // threshold with strand bias and the depth
-                let mut sor_max = args.strand_odds_max;
-                if args.strand_odds_gain > 0.0 && noise_threshold > 0.0 && af > noise_threshold {
+                // how much strand skew this variant has earned. You have more confidence in a variant with a
+                // ton of read support even if it is skewed to one strand, so discount its SOR by the evidence
+                // behind it: read support times how far the af sits above the local noise. Capped at the
+                // cutoff, so a well-supported variant comes down from 16 to 8 but no further
+                let mut sor_discount = 0.0;
+                if args.sor_adj_multiplier > 0.0 && noise_threshold > 0.0 && af > noise_threshold {
                     let above_noise = (af / noise_threshold).log10().clamp(0.0, 1.0);
-                    let support = (alt_count as f64 / MIN_KMER_COUNT as f64).max(1.0).log10();
-                    sor_max = (args.strand_odds_max + args.strand_odds_gain * support * above_noise)
-                        .min(2.0 * args.strand_odds_max);
+                    let support = (alt_count as f64).max(1.0).log10();
+                    sor_discount = (args.sor_adj_multiplier * support * above_noise).min(args.strand_odds_max);
                 }
 
                 // NEW Strand filter logic
                 let mut sor = args.strand_odds_max + 1.0; //default is above the given so filtered if not able to calculate
+                let mut sor_adjusted = sor;
                 if strand_filter {
                     let a = row[ref_base as usize] as f64 + 1.0; //ref fwd
                     let b = row_rev[ref_base as usize] as f64 + 1.0; //ref rev
@@ -2014,9 +2015,10 @@ pub fn call_variants(
 
                         //Using GATK strand odds ratio
                         sor = strand_odds_ratio(row[ref_base as usize], row_rev[ref_base as usize], row[alt_base as usize], row_rev[alt_base as usize]);
+                        sor_adjusted = sor - sor_discount;
 
-                        // filter out if greater than the strand odds ratio this variant has earned
-                        if sor > sor_max {
+                        // filter out if the discounted strand odds ratio is still over the cutoff
+                        if sor_adjusted > args.strand_odds_max {
                             continue;
                         }
 
@@ -2029,6 +2031,7 @@ pub fn call_variants(
                         }
                     } else {
                         sor = -1.0; //output SOR == -1.0 if the strand is unbalanced so not tested
+                        sor_adjusted = -1.0;
                     }
                 }
 
@@ -2063,7 +2066,7 @@ pub fn call_variants(
                     depth: total_depth,
                     af: af,
                     sor: sor,
-                    sor_max: if strand_filter { sor_max } else { -1.0 }
+                    sor_adjusted: if strand_filter { sor_adjusted } else { -1.0 }
                 })
 
             }
