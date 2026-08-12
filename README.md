@@ -22,7 +22,7 @@ bronko also allows users to run multiple samples of the same strain/species and 
 4. **Comparable precision and sensitivity** -- On our benchmarks so far, bronko achieves reasonable consistency with both ivar and lofreq on variant calling for both SNPs and iSNVs, and generates multiple sequence alignments that are consistent with core-genome alignment software (Parsnp2).
 
 > [!IMPORTANT]
-> New feature in v0.1.4: bronko can now call indels! Please note that this aspect of the software is still in early stages (please let me know if you find any bugs).
+> New feature in v0.1.4: bronko can now call indels! Please note that this aspect of the software is still in early stages (please let me know if you find any bugs). To enable use the `--indels` flag when running `bronko call`
 > Additional documentation is available in the wiki.  
 
 ### How does bronko work
