@@ -4,8 +4,10 @@ use crate::lcb::*;
 use log::*;
 use dashmap::DashMap;
 
-pub const ANCHOR_MARGIN: usize = 2; // pull anchor k-mers this many bases off the breakpoint, since coverage right at the cliff is unreliable
-pub const ANCHOR_DEPTH_CONSISTENCY: f64 = 0.50; // an anchor window is only trusted if min/max total depth across it stays >= this fraction
+pub const ANCHOR_MARGIN: usize = 2; //pull anchors this far off the breakpoint, coverage at the cliff is unreliable
+pub const ANCHOR_DEPTH_CONSISTENCY: f64 = 0.50; //min/max depth across an anchor window must stay above this
+pub const ANCHOR_SEARCH_MAX: usize = 50; //how far an anchor may slide looking for a clean window
+pub const MAX_END_EXTENSION: usize = 100; //longest end walk, so a wrong turn cannot rewrite a long stretch
 
 #[derive(Debug, Clone)]
 pub struct Breakpoint {
@@ -24,6 +26,17 @@ pub struct SeqIndelInfo {
     pub pairs: Vec<(Breakpoint, Breakpoint)>, // drop -> following-rise pairs (candidate indels)
 }
 
+// a planned internal indel, carrying the anchors the planner validated so reconstruction reuses them
+#[derive(Debug, Clone)]
+pub struct IndelEvent {
+    pub drop: Breakpoint,
+    pub rise: Breakpoint,
+    pub left_anchor: (usize, usize),  // 0-based inclusive
+    pub right_anchor: (usize, usize), // 0-based inclusive
+    pub left_depth: u64,              // min total depth across the left anchor
+    pub right_depth: u64,             // min total depth across the right anchor
+}
+
 // which terminus an end reconstruction rebuilds toward
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndSide {
@@ -31,8 +44,7 @@ pub enum EndSide {
     Three, // 3' end: anchor walks right toward the terminus
 }
 
-// an end-reconstruction anchor for when an indel sits too close to a terminus to place a clean outer
-// anchor; its clean inner anchor starts the end walk instead of the generic first_good/last_good anchor
+// where to start an end walk when an indel sits too close to a terminus to bridge
 #[derive(Debug, Clone)]
 pub struct EndAnchor {
     pub seq: String,
@@ -40,9 +52,7 @@ pub struct EndAnchor {
     pub anchor_first_base: usize, // 0-based first base of the anchor k-mer
 }
 
-// 0-based inclusive window of the left anchor k-mer for a drop at 1-based `drop_pos`. The anchor ends
-// ANCHOR_MARGIN bases before the drop (the -2 also converts 1-based to 0-based and steps off the cliff).
-// None if it runs off the start of the sequence.
+// 0-based inclusive left anchor window for a drop at 1-based `drop_pos`; the -2 also converts to 0-based
 fn left_anchor_window(drop_pos: usize, k: usize) -> Option<(usize, usize)> {
     let left_end = drop_pos.checked_sub(ANCHOR_MARGIN + 2)?;
     if left_end + 1 < k {
@@ -51,8 +61,7 @@ fn left_anchor_window(drop_pos: usize, k: usize) -> Option<(usize, usize)> {
     Some((left_end + 1 - k, left_end))
 }
 
-// 0-based inclusive window of the right anchor k-mer for a rise at 1-based `rise_pos`. The anchor starts
-// ANCHOR_MARGIN bases past the rise. None if it runs off the end of the sequence.
+// 0-based inclusive right anchor window for a rise at 1-based `rise_pos`
 fn right_anchor_window(rise_pos: usize, k: usize, ref_len: usize) -> Option<(usize, usize)> {
     let start = (rise_pos - 1) + ANCHOR_MARGIN;
     if start + k > ref_len {
@@ -61,16 +70,58 @@ fn right_anchor_window(rise_pos: usize, k: usize, ref_len: usize) -> Option<(usi
     Some((start, start + k - 1))
 }
 
-// does the cliff of the breakpoint at 1-based `pos` overlap the 0-based inclusive window? The cliff spans
-// total[i-1] -> total[i], i.e. positions [pos-2, pos-1], so test that interval against the window.
+// slide the left anchor off the drop until it lands on a clean window; the fixed offset often
+// straddles an unrelated coverage step
+fn find_left_anchor(
+    drop_pos: usize,
+    k: usize,
+    total: &[u64],
+    bps: &[Breakpoint],
+) -> Option<(usize, usize)> {
+    let (_, end) = left_anchor_window(drop_pos, k)?;
+    for back in 0..=ANCHOR_SEARCH_MAX {
+        let e = end.checked_sub(back)?;
+        if e + 1 < k {
+            return None;
+        }
+        let w = (e + 1 - k, e);
+        if window_is_clean(w, total, bps) {
+            return Some(w);
+        }
+    }
+    None
+}
+
+// same, sliding the right anchor further past the rise
+fn find_right_anchor(
+    rise_pos: usize,
+    k: usize,
+    ref_len: usize,
+    total: &[u64],
+    bps: &[Breakpoint],
+) -> Option<(usize, usize)> {
+    let (start, _) = right_anchor_window(rise_pos, k, ref_len)?;
+    for fwd in 0..=ANCHOR_SEARCH_MAX {
+        let s = start + fwd;
+        if s + k > ref_len {
+            return None;
+        }
+        let w = (s, s + k - 1);
+        if window_is_clean(w, total, bps) {
+            return Some(w);
+        }
+    }
+    None
+}
+
+// does the cliff at 1-based `pos` overlap the window? the cliff spans positions [pos-2, pos-1]
 fn cliff_in_window(pos: usize, window: (usize, usize)) -> bool {
     let a = pos.saturating_sub(2);
     let b = pos.saturating_sub(1);
     a <= window.1 && b >= window.0
 }
 
-// a window is clean if it lies inside the sequence, holds no other breakpoint's cliff, and keeps
-// consistent depth (min/max across the window >= ANCHOR_DEPTH_CONSISTENCY)
+// clean = inside the sequence, no breakpoint cliff inside it, and consistent depth across it
 fn window_is_clean(window: (usize, usize), total: &[u64], breakpoints: &[Breakpoint]) -> bool {
     let (s, e) = window;
     if e >= total.len() || s > e {
@@ -100,9 +151,8 @@ fn total_depth(fwd: &OutputData, rev: &OutputData) -> Vec<u64> {
         .collect()
 }
 
-// detect indel breakpoints in the genome's pileup and pair them into candidate indels. A breakpoint is a
-// sharp total-depth change between neighbors (min/max < max_ratio); a drop followed by a nearby rise is
-// the coverage signature of an indel. Returns the (drop, rise) pairs grouped by sequence name.
+// detect breakpoints (sharp depth changes between neighbors) and pair each drop with the next rise,
+// which is the coverage signature of an indel. Returns the pairs grouped by sequence.
 pub fn identify_indel_breakpoints(
     output: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
@@ -183,17 +233,16 @@ pub fn identify_indel_breakpoints(
     grouped
 }
 
-// turn the breakpoint pairs into a reconstruction plan, making sure every anchor k-mer sits over clean,
-// consistently-covered reference settings. Neighboring pairs with colliding anchor windows are merged into one
-// event; events too close to a terminus to anchor are handed off to end reconstruction, and the rest
-// become internal pairs (events left unclean by a stray breakpoint or depth wobble are dropped).
-// Returns (internal pairs grouped by sequence, end anchors) for reconstruct_indels / reconstruct_ends.
+// turn breakpoint pairs into a reconstruction plan. Pairs too close to seed separately are merged,
+// events reaching a terminus are handed to end reconstruction, and the rest become internal events with
+// clean anchors. Returns (internal events by sequence, end anchors).
 pub fn plan_indel_events(
     infos: &[SeqIndelInfo],
     k: usize,
     min_depth: u64,
-) -> (Vec<(String, Vec<(Breakpoint, Breakpoint)>)>, Vec<EndAnchor>) {
-    let mut internal: Vec<(String, Vec<(Breakpoint, Breakpoint)>)> = Vec::new();
+    gap_max_depth: u64, // a position at or under this counts as unassembled, so worth rebuilding
+) -> (Vec<(String, Vec<IndelEvent>)>, Vec<EndAnchor>) {
+    let mut internal: Vec<(String, Vec<IndelEvent>)> = Vec::new();
     let mut ends: Vec<EndAnchor> = Vec::new();
 
     for info in infos {
@@ -201,26 +250,14 @@ pub fn plan_indel_events(
         let ref_len = total.len();
         let bps = &info.breakpoints;
 
-        // ---- merge pass: collapse neighboring pairs whose anchor windows collide ----
-        // a merge only extends a pair's rise rightward, so one left-to-right pass chains colliding pairs
+        // merge pairs with no room between them for a solid seed, since they are one disruption.
+        // a merge only extends the rise rightward, so one left-to-right pass chains them
+        let min_separation = k + ANCHOR_MARGIN;
         let mut merged: Vec<(Breakpoint, Breakpoint)> = Vec::new();
         for (drop, rise) in &info.pairs {
-            // copy prev rise pos out to release the immutable borrow of `merged` before the mutable one
             let mut collide = false;
             if let Some((_, prev_rise)) = merged.last() {
-                let prev_rise_pos = prev_rise.pos;
-                let rw = right_anchor_window(prev_rise_pos, k, ref_len);
-                let lw = left_anchor_window(drop.pos, k);
-                collide = match (rw, lw) {
-                    (Some(rw), Some(lw)) => {
-                        let overlap = rw.0 <= lw.1 && lw.0 <= rw.1;
-                        overlap
-                            || cliff_in_window(drop.pos, rw)    // this pair's drop sits in prev's right anchor
-                            || cliff_in_window(prev_rise_pos, lw) // prev's rise sits in this pair's left anchor
-                    }
-                    // a missing window means no room for a clean anchor between them -> merge
-                    _ => true,
-                };
+                collide = drop.pos.saturating_sub(prev_rise.pos) < min_separation;
             }
             if collide {
                 merged.last_mut().unwrap().1 = rise.clone();
@@ -233,13 +270,23 @@ pub fn plan_indel_events(
         let first_good = total.iter().position(|&d| d >= min_depth);
         let last_good = total.iter().rposition(|&d| d >= min_depth);
 
-        let mut seq_internal: Vec<(Breakpoint, Breakpoint)> = Vec::new();
+        let mut seq_internal: Vec<IndelEvent> = Vec::new();
         for (drop, rise) in merged {
-            let lw = left_anchor_window(drop.pos, k);
-            let rw = right_anchor_window(rise.pos, k, ref_len);
+            // only rebuild where the reads actually failed. Every called SNV makes a depth cliff as
+            // its neighbours lose their deposits, but that dip still assembles, so require a position
+            // with essentially no coverage
+            let lo = drop.pos.saturating_sub(1).min(ref_len);
+            let hi = rise.pos.min(ref_len);
+            if !(lo..hi).any(|p| total[p] <= gap_max_depth) {
+                continue;
+            }
 
-            // an outer anchor that runs off the sequence or out of covered reference means this side
-            // reaches a terminus: hand off to end reconstruction instead of bridging
+            // slide each anchor out to the nearest clean window rather than demanding the fixed offset
+            let lw = find_left_anchor(drop.pos, k, total, bps);
+            let rw = find_right_anchor(rise.pos, k, ref_len, total, bps);
+
+            // an anchor running off the sequence or out of covered reference means this side reaches
+            // a terminus, so hand it to end reconstruction instead of bridging
             let near_five = match lw {
                 None => true,
                 Some((s, _)) => first_good.map_or(true, |fg| s < fg),
@@ -252,31 +299,33 @@ pub fn plan_indel_events(
             if near_five {
                 // rebuild the 5' end: anchor at the event's clean right anchor, walk left to the terminus
                 if let Some((s, _)) = rw {
-                    if window_is_clean((s, s + k - 1), total, bps) {
-                        ends.push(EndAnchor { seq: info.seq.clone(), side: EndSide::Five, anchor_first_base: s });
-                    }
+                    ends.push(EndAnchor { seq: info.seq.clone(), side: EndSide::Five, anchor_first_base: s });
                 }
             }
             if near_three {
                 // rebuild the 3' end: anchor at the event's clean left anchor, walk right to the terminus
-                if let Some((s, e)) = lw {
-                    if window_is_clean((s, e), total, bps) {
-                        ends.push(EndAnchor { seq: info.seq.clone(), side: EndSide::Three, anchor_first_base: s });
-                    }
+                if let Some((s, _)) = lw {
+                    ends.push(EndAnchor { seq: info.seq.clone(), side: EndSide::Three, anchor_first_base: s });
                 }
             }
             if near_five || near_three {
                 continue; // handled as an end (or un-anchorable); never bridged
             }
 
-            // internal event: both outer anchors must be clean reference, else drop it
-            match (lw, rw) {
-                (Some(lw), Some(rw))
-                    if window_is_clean(lw, total, bps) && window_is_clean(rw, total, bps) =>
-                {
-                    seq_internal.push((drop, rise));
-                }
-                _ => {}
+            // internal event: needs clean anchors on both sides. The bridge is gated on the anchors'
+            // own depth, since a searched anchor can sit in quite different coverage
+            if let (Some(left_anchor), Some(right_anchor)) = (lw, rw) {
+                let depth_at = |(s, e): (usize, usize)| {
+                    total[s..=e].iter().copied().min().unwrap_or(0)
+                };
+                seq_internal.push(IndelEvent {
+                    left_depth: depth_at(left_anchor),
+                    right_depth: depth_at(right_anchor),
+                    drop,
+                    rise,
+                    left_anchor,
+                    right_anchor,
+                });
             }
         }
 
@@ -298,9 +347,8 @@ pub struct ReconstructedIndel {
     pub allele: Vec<u8>,  // reconstructed ASCII bases spanning [ref_start, ref_end] inclusive, spliced over that footprint
 }
 
-// sum both-strand read support for extending a (k-1)-mer by each base. Since the map is keyed on canonical
-// buckets, support can live in the forward bucket or the reverse-complement bucket (complemented base), so
-// both are summed. `extend_right` extends to the right, else to the left. Returns per-base [A,C,G,T] counts.
+// both-strand read support for extending a (k-1)-mer by each base. The map is keyed on canonical buckets,
+// so support sits in either the forward or the rc bucket (complemented base) and both are summed.
 fn flanking_base_counts(
     km1: u64,
     k: usize,
@@ -328,8 +376,7 @@ fn flanking_base_counts(
     let fwd_row = flanking_base_map.get(&b_fwd).map(|r| *r); // copy the [[u64;4];2] out of the guard
     let rc_row = flanking_base_map.get(&b_rc).map(|r| *r);
 
-    // both strands of a canonical k-mer share a bucket split across the two rc rows, so sum both rows;
-    // only one of fwd_row/rc_row is non-empty, so there's no double counting
+    // sum both rc rows; only one of fwd_row/rc_row is non-empty so nothing is double counted
     let mut counts = [0u64; 4];
     for b in 0..4usize {
         let cf = fwd_row.map(|x| x[0][b] + x[1][b]).unwrap_or(0);
@@ -345,17 +392,15 @@ fn pick_major_base(counts: &[u64; 4]) -> Option<(u8, u64)> {
     (c > 0).then_some((b as u8, c))
 }
 
-// reconstruct the allele bridging a drop and a rise by walking the de Bruijn graph left-to-right from
-// `left_kmer` to `right_kmer`, taking the major-supported base each step until the running k-mer overlaps
-// the right anchor. Each base's support must stay within [DEPTH_LO, DEPTH_HI] of the nearer anchor depth
-// (left_depth over the first half of the bridge, right_depth over the second), else the bridge is
-// rejected. Gives up after MAX_BRIDGE bases or at a dead end. The returned allele spans the full
-// [left_kmer, right_kmer] footprint, ready to splice back in.
+// bridge a drop and a rise by walking the de Bruijn graph from `left_kmer` to `right_kmer`, taking the
+// major-supported base each step. Every base's support must sit inside the anchors' depth band, else the
+// bridge is rejected. Returns the allele spanning the whole [left_kmer, right_kmer] footprint.
 fn reconstruct_indel(
     left_kmer: &[u8],
     left_depth: u64,
     right_kmer: &[u8],
     right_depth: u64,
+    ref_gap: usize, // reference bases between the two anchors, so the walk budget fits the geometry
     k: usize,
     flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
 ) -> Option<Vec<u8>> {
@@ -371,9 +416,9 @@ fn reconstruct_indel(
     let mask_k = (1u64 << (2 * k)) - 1;
     let mask_km1 = (1u64 << (2 * km1)) - 1;
 
-    // the walk must cover the right anchor's k-1 overlap before cur's [0] bucket can match, so cap the
-    // extension at that overlap plus the largest novel bridge we allow
-    let max_ext = km1 + MAX_BRIDGE;
+    // the walk crosses the reference gap, then overlaps the right anchor by k-1 before its [0] bucket
+    // can match; MAX_BRIDGE is the slack for a novel insertion
+    let max_ext = ref_gap + km1 + MAX_BRIDGE;
 
     let left_val = kmer_to_u64(left_kmer);
     let right_val = kmer_to_u64(right_kmer);
@@ -415,13 +460,13 @@ fn reconstruct_indel(
         }
     }
 
-    // depth band, per side: first half of the bridge gated by left_depth, second half by right_depth
-    let l = bridge.len();
-    for (i, &(_, support)) in bridge.iter().enumerate() {
-        let depth = if i * 2 < l { left_depth } else { right_depth };
-        let lo = DEPTH_LO * depth as f64;
-        let hi = DEPTH_HI * depth as f64;
+    // depth band over the whole bridge, bounded by the envelope of the two anchors; a per-side band
+    // cannot describe a bridge crossing a real coverage step
+    let lo = DEPTH_LO * left_depth.min(right_depth) as f64;
+    let hi = DEPTH_HI * left_depth.max(right_depth) as f64;
+    for &(_, support) in &bridge {
         if (support as f64) < lo || (support as f64) > hi {
+            trace!("bridge support {} outside depth band [{:.0}, {:.0}]", support, lo, hi);
             return None;
         }
     }
@@ -442,41 +487,35 @@ fn reconstruct_indel(
     Some(allele)
 }
 
-// reconstruct an allele for each anchor-validated pair from plan_indel_events. The reference is looked up
-// by name from the genome's output table; the geometry helpers re-derive the anchor windows here.
+// reconstruct an allele for each event from plan_indel_events, using the anchors the planner validated
 pub fn reconstruct_indels(
     output: &DashMap<String, OutputData>,
     flanking_base_map: &DashMap<u64, [[u64; 4]; 2]>,
-    grouped_pairs: &[(String, Vec<(Breakpoint, Breakpoint)>)],
+    grouped_pairs: &[(String, Vec<IndelEvent>)],
     k: usize,
 ) -> Vec<ReconstructedIndel> {
     let mut results: Vec<ReconstructedIndel> = Vec::new();
 
-    for (seq, pairs) in grouped_pairs {
+    for (seq, events) in grouped_pairs {
         let ref_entry = match output.get(seq) {
             Some(e) => e,
             None => continue,
         };
         let ref_bases = &ref_entry.ref_bases;
 
-
-        for (drop, rise) in pairs {
-            // left k-mer ends ANCHOR_MARGIN bases before the last covered base ahead of the drop;
-            // right k-mer starts ANCHOR_MARGIN bases after the first covered base past the rise
+        for event in events {
+            let (drop, rise) = (&event.drop, &event.rise);
             trace!(
                 "attempting to reconstruct indel between drop at {} and rise at {} on sequence {}",
                 drop.pos,
                 rise.pos,
                 seq
             );
-            let (left_start, left_end) = match left_anchor_window(drop.pos, k) {
-                Some(w) => w,
-                None => continue,
-            };
-            let (right_start, right_end) = match right_anchor_window(rise.pos, k, ref_bases.len()) {
-                Some(w) => w,
-                None => continue,
-            };
+            let (left_start, left_end) = event.left_anchor;
+            let (right_start, right_end) = event.right_anchor;
+            if left_end >= ref_bases.len() || right_end >= ref_bases.len() {
+                continue;
+            }
 
             let left_kmer = &ref_bases[left_start..=left_end];
             let right_kmer = &ref_bases[right_start..=right_end];
@@ -497,9 +536,10 @@ pub fn reconstruct_indels(
 
             if let Some(allele) = reconstruct_indel(
                 left_kmer,
-                drop.depth_high,
+                event.left_depth,
                 right_kmer,
-                rise.depth_high,
+                event.right_depth,
+                right_start.saturating_sub(left_end + 1), // reference bases between the anchors
                 k,
                 flanking_base_map,
             ) {
@@ -518,10 +558,9 @@ pub fn reconstruct_indels(
     results
 }
 
-// walk the de Bruijn graph outward from a single anchor k-mer, taking the major-supported base, to rebuild
-// a sequence end. `extend_right` walks toward the 3' terminus (appending), else toward the 5' start
-// (prepending). With no second anchor to meet, it runs until `max_extension` bases (the caller caps this
-// at the reference length) or a dead end. Returned bases are in left-to-right reference order.
+// walk out from a single anchor k-mer to rebuild a sequence end, taking the major-supported base each
+// step. With no second anchor to meet it runs to `max_extension` or a dead end. Returns bases in
+// left-to-right reference order.
 fn reconstruct_end(
     anchor_kmer: &[u8],
     extend_right: bool,
@@ -565,13 +604,10 @@ fn reconstruct_end(
     bases
 }
 
-// reconstruct the 5' and/or 3' ends of each sequence: anchor a k-mer just inside the covered region (the
-// first/last position reaching `min_depth`, pulled in by END_ANCHOR_MARGIN) and walk outward to the
-// terminus, capped at the reference boundary. Each end comes back as a length-preserving ReconstructedIndel
-// so it splices through the same machinery, but it only improves the consensus -- the caller does not
-// report it as a variant, and coordinates stay unchanged. Unreached terminal bases are left as the
-// consensus produced them (N without coverage). `end_anchors` lets the planner override where an end walk
-// begins when an indel sits too close to a terminus to bridge; otherwise the generic anchor is used.
+// rebuild each sequence's 5' and 3' ends: anchor just inside the covered region and walk outward to the
+// terminus. Each end returns a length-preserving ReconstructedIndel so it splices through the same
+// machinery without shifting coordinates, and it only improves the consensus -- the caller never reports
+// it as a variant. `end_anchors` overrides where a walk starts when the planner handed one off.
 pub fn reconstruct_ends(
     output: &DashMap<String, OutputData>,
     output_rev: &DashMap<String, OutputData>,
@@ -610,36 +646,10 @@ pub fn reconstruct_ends(
             .find(|e| e.seq == *seq && e.side == EndSide::Three)
             .map(|e| e.anchor_first_base);
 
-        // ---- 5' start: anchor just inside the first covered position (or at the override), walk left ----
-        // 0-based first base of the anchor k-mer: the planner's override wins, else the generic first_good anchor
+        // anchor just inside the first/last covered position (or at the planner's override) and walk out
         let anchor_start_5 = override_five.or_else(|| {
             first_good.and_then(|fg| (fg > 0).then(|| fg + END_ANCHOR_MARGIN))
         });
-        if let Some(anchor_start) = anchor_start_5 {
-            let anchor_end = anchor_start + k - 1; // 0-based last base
-            if anchor_end < len && is_acgt(&ref_bases[anchor_start..=anchor_end]) {
-                let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
-                // walk left at most `anchor_start` bases (reaching position 0 = the reference start)
-                let head = reconstruct_end(anchor_kmer, false, anchor_start, k, flanking_base_map);
-                if !head.is_empty() {
-                    // footprint exactly spans the rebuilt region [anchor_start - head.len(), anchor_end]
-                    let ref_start = anchor_start - head.len() + 1; // 1-based
-                    let mut allele = head;
-                    allele.extend_from_slice(anchor_kmer);
-                    results.push(ReconstructedIndel {
-                        seq: seq.clone(),
-                        drop_pos: 1,
-                        rise_pos: anchor_start + 1,
-                        ref_start,
-                        ref_end: anchor_end + 1,
-                        allele,
-                    });
-                }
-            }
-        }
-
-        // ---- 3' end: anchor just inside the last covered position (or at the override), walk right ----
-        // 0-based first base of the anchor k-mer: the planner's override wins, else the generic last_good anchor
         let anchor_start_3 = override_three.or_else(|| {
             last_good.and_then(|lg| {
                 if lg + 1 < len && lg >= END_ANCHOR_MARGIN {
@@ -650,36 +660,59 @@ pub fn reconstruct_ends(
                 }
             })
         });
-        if let Some(anchor_start) = anchor_start_3 {
+
+        for (side, anchor_start) in [(EndSide::Five, anchor_start_5), (EndSide::Three, anchor_start_3)] {
+            let anchor_start = match anchor_start {
+                Some(a) => a,
+                None => continue,
+            };
             let anchor_end = anchor_start + k - 1; // 0-based last base
-            if anchor_end < len && is_acgt(&ref_bases[anchor_start..=anchor_end]) {
-                let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
-                let max_ext = (len - 1) - anchor_end; // reach the last reference position at most
-                let tail = reconstruct_end(anchor_kmer, true, max_ext, k, flanking_base_map);
-                if !tail.is_empty() {
-                    // footprint exactly spans the rebuilt region [anchor_start, anchor_end + tail.len()]
-                    let ref_end = anchor_end + tail.len() + 1; // 1-based
-                    let mut allele = anchor_kmer.to_vec();
-                    allele.extend_from_slice(&tail);
-                    results.push(ReconstructedIndel {
-                        seq: seq.clone(),
-                        drop_pos: anchor_end + 1,
-                        rise_pos: len,
-                        ref_start: anchor_start + 1,
-                        ref_end,
-                        allele,
-                    });
-                }
+            if anchor_end >= len || !is_acgt(&ref_bases[anchor_start..=anchor_end]) {
+                continue;
             }
+            let anchor_kmer = &ref_bases[anchor_start..=anchor_end];
+
+            // room to the terminus, capped so a wrong turn cannot rewrite a long stretch
+            let (extend_right, room) = match side {
+                EndSide::Five => (false, anchor_start),
+                EndSide::Three => (true, (len - 1) - anchor_end),
+            };
+            let walked = reconstruct_end(anchor_kmer, extend_right, room.min(MAX_END_EXTENSION), k, flanking_base_map);
+            if walked.is_empty() {
+                continue;
+            }
+
+            // footprint spans exactly the rebuilt region plus the anchor
+            let n = walked.len();
+            let (drop_pos, rise_pos, ref_start, ref_end, allele) = match side {
+                EndSide::Five => {
+                    let mut allele = walked;
+                    allele.extend_from_slice(anchor_kmer);
+                    (1, anchor_start + 1, anchor_start - n + 1, anchor_end + 1, allele)
+                }
+                EndSide::Three => {
+                    let mut allele = anchor_kmer.to_vec();
+                    allele.extend_from_slice(&walked);
+                    (anchor_end + 1, len, anchor_start + 1, anchor_end + n + 1, allele)
+                }
+            };
+
+            results.push(ReconstructedIndel {
+                seq: seq.clone(),
+                drop_pos,
+                rise_pos,
+                ref_start,
+                ref_end,
+                allele,
+            });
         }
     }
 
     results
 }
 
-// sorted, validated, non-overlapping indels for `seq_name`, each as (start_0based, end_exclusive, indel).
-// 1-based inclusive [ref_start, ref_end] footprints are converted to 0-based [start, end); malformed
-// footprints and any overlapping an already-kept one are dropped so callers stay consistent with each other.
+// sorted, validated, non-overlapping indels for `seq_name` as (start_0based, end_exclusive, indel).
+// malformed footprints and any overlapping an already-kept one are dropped.
 fn ordered_indels<'a>(
     seq_name: &str,
     indels: &'a [ReconstructedIndel],
@@ -706,18 +739,43 @@ fn ordered_indels<'a>(
     out
 }
 
-// splice the indels for `seq_name` into a coordinate-matched buffer `bases` (reference or per-position
-// consensus, same length and coordinates), returning the rebuilt sequence. Each `allele` replaces its
-// footprint; see ordered_indels for the validation/overlap handling.
+// same length as its footprint means a block substitution, not an indel: it patches in place and
+// leaves coordinates untouched
+fn is_block_substitution(indel: &ReconstructedIndel, len: usize) -> bool {
+    if indel.ref_start < 1 || indel.ref_end > len || indel.ref_start > indel.ref_end {
+        return false;
+    }
+    indel.allele.len() == indel.ref_end - (indel.ref_start - 1)
+}
+
+// splice the indels for `seq_name` into `bases` (same length and coordinates), returning the rebuilt sequence
 pub fn splice_indels(bases: &[u8], seq_name: &str, indels: &[ReconstructedIndel]) -> Vec<u8> {
-    let mut new_seq: Vec<u8> = Vec::with_capacity(bases.len());
+    // block substitutions only fill gaps, so overlapping ones can all apply; only length-changing
+    // indels need the non-overlap discipline in ordered_indels
+    let mut patched = bases.to_vec();
+    for ind in indels.iter().filter(|i| i.seq == seq_name && is_block_substitution(i, bases.len())) {
+        let start = ind.ref_start - 1;
+        for (off, &b) in ind.allele.iter().enumerate() {
+            if patched[start + off] == b'N' {
+                patched[start + off] = b;
+            }
+        }
+    }
+
+    let real: Vec<ReconstructedIndel> = indels
+        .iter()
+        .filter(|i| i.seq == seq_name && !is_block_substitution(i, bases.len()))
+        .cloned()
+        .collect();
+
+    let mut new_seq: Vec<u8> = Vec::with_capacity(patched.len());
     let mut cursor = 0usize; // 0-based index of the next base to copy
-    for (start, end, indel) in ordered_indels(seq_name, indels, bases.len()) {
-        new_seq.extend_from_slice(&bases[cursor..start]); // bases up to the footprint
-        new_seq.extend_from_slice(&indel.allele); // the reconstructed allele
+    for (start, end, indel) in ordered_indels(seq_name, &real, patched.len()) {
+        new_seq.extend_from_slice(&patched[cursor..start]); // bases up to the footprint
+        new_seq.extend_from_slice(&indel.allele); // a real length change: replace the footprint
         cursor = end;
     }
-    new_seq.extend_from_slice(&bases[cursor..]); // remaining tail
+    new_seq.extend_from_slice(&patched[cursor..]); // remaining tail
 
     new_seq
 }
@@ -749,15 +807,20 @@ pub struct CoordMap {
     pub orig_to_corrected: Vec<Option<usize>>,
 }
 
-// build the coordinate map for `seq_name`; `ref_len` is the original reference length. Mirrors
-// `splice_indels`: copied runs map 1:1 and overlapping/malformed indels are skipped identically, so the
-// map stays consistent with the spliced sequence.
+// coordinate map for `seq_name`, mirroring splice_indels so the map matches the spliced sequence
 pub fn build_coord_map(ref_len: usize, seq_name: &str, indels: &[ReconstructedIndel]) -> CoordMap {
     let mut corrected_to_orig: Vec<Option<usize>> = Vec::with_capacity(ref_len);
     let mut orig_to_corrected: Vec<Option<usize>> = vec![None; ref_len];
 
+    // only length-changing indels shift coordinates, so filter as splice_indels does
+    let real: Vec<ReconstructedIndel> = indels
+        .iter()
+        .filter(|i| i.seq == seq_name && !is_block_substitution(i, ref_len))
+        .cloned()
+        .collect();
+
     let mut cursor = 0usize; // next original 0-based base to copy
-    for (start, end, indel) in ordered_indels(seq_name, indels, ref_len) {
+    for (start, end, indel) in ordered_indels(seq_name, &real, ref_len) {
         // copied run [cursor, start): 1:1 in both directions
         for orig in cursor..start {
             orig_to_corrected[orig] = Some(corrected_to_orig.len());

@@ -409,7 +409,7 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
+            let (first_pass_variants, _, _, fp_breadth, fp_depth) = call_variants(
                 &args,
                 output,
                 output_counts,
@@ -426,21 +426,21 @@ pub fn call(args: CallArgs) {
 
             // reconstruct indels and sequence ends unless disabled
             let (reconstructed_indels, reconstructed_ends) = if !args.indel_detection {
-                info!("Indel reconstruction disabled (--no-indels)");
+                info!("Indel reconstruction disabled (use --indels to enable)");
                 (Vec::new(), Vec::new())
             } else {
                 let infos = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
-                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64);
+                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64, args.min_kmers as u64);
                 let n_breakpoints: usize = infos.iter().map(|i| i.breakpoints.len()).sum();
                 let n_pairs: usize = merged_pairs.iter().map(|(_, p)| p.len()).sum();
-                info!("Identified {} breakpoints across {} sequences; planned {} internal indel event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
-                trace!("Planned internal indel pairs: {:?}", merged_pairs);
+                info!("Identified {} breakpoints across {} sequences; planned {} internal reconstruction event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
+                trace!("Planned internal reconstruction location pairs: {:?}", merged_pairs);
                 trace!("Planned end anchors: {:?}", end_anchors);
 
                 let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &merged_pairs, args.kmer);
-                info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+                info!("Reconstructed {} internal alleles", reconstructed_indels.len());
                 for indel in &reconstructed_indels {
-                    info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
+                    info!("  internal {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
                 }
 
                 let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
@@ -465,14 +465,14 @@ pub fn call(args: CallArgs) {
             let has_indels = !consensus_edits.is_empty();
 
             if !has_indels {
-                info!("No indels or sequence ends were reconstructed, skipping second pass of mapping");
+                info!("No internal alleles or sequence ends were reconstructed, skipping second pass of mapping");
             } else {
-                info!("Printing reconstructed consensus sequence for sample {} ({} indel/ends)", clean_sample_id(se_read), consensus_edits.len());
+                info!("Printing reconstructed consensus sequence for sample {} ({} internal alleles/ends)", clean_sample_id(se_read), consensus_edits.len());
             }
 
             // print the sample consensus so we can use it for the second pass (if anything was reconstructed)
             if args.output_consensus || has_indels {
-                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
+                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits);
             }
 
             // Second pass of mapping if reconstructed
@@ -521,7 +521,7 @@ pub fn call(args: CallArgs) {
             // Print the final variants. First-pass major SNVs are always carried over. If there was a second pass, the
             // the minor variants and any indels or new SNVs are also carried over and translated position-wise. Without a second pass, the first-pass
             // call is the final result as-is.
-            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
+            let (mut variants, _, _, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
                 let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
                     &args,
                     cur_output,
@@ -567,13 +567,10 @@ pub fn call(args: CallArgs) {
                     }
                 }
 
-                // recount SNVs from the merged set (indel records are added and counted separately below)
-                let num_major_snp = merged.iter().filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
-                let num_minor_snp = merged.iter().filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
-
-                (merged, num_major_snp, num_minor_snp, sp_breadth, sp_depth)
+                // SNV counts are taken from `variants` once the indel records are in
+                (merged, 0, 0, sp_breadth, sp_depth)
             } else {
-                (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth)
+                (first_pass_variants, 0, 0, fp_breadth, fp_depth)
             };
             log_memory_usage(true, "Called variants successfully");
 
@@ -582,19 +579,40 @@ pub fn call(args: CallArgs) {
             let mut num_insertions = 0;
             let mut num_deletions = 0;
             if let Some(coord_maps) = coord_maps_opt {
+                // positions already reported as SNPs, so a split block does not double-report them
+                let mut snp_seen: FxHashSet<(String, usize)> = variants
+                    .iter()
+                    .filter(|r| r.ref_allele.len() == 1 && r.alt_allele.len() == 1)
+                    .map(|r| (r.seq.clone(), r.pos))
+                    .collect();
+
                 for indel in &reconstructed_indels {
                     if let Some(coord_map) = coord_maps.get(&indel.seq) {
                         if let Some(rec) = indel_to_vcf_record(indel, output, output_rev, cur_output, cur_output_rev, coord_map) {
-                            match rec.var_type() {
-                                "INS" => num_insertions += 1,
-                                "DEL" => num_deletions += 1,
-                                _ => {}
+                            let split = split_block_substitution(&rec, coord_map, cur_output, cur_output_rev);
+                            if split.is_empty() {
+                                match rec.var_type() {
+                                    "INS" => num_insertions += 1,
+                                    "DEL" => num_deletions += 1,
+                                    _ => {}
+                                }
+                                variants.push(rec);
+                            } else {
+                                for snp in split {
+                                    if snp_seen.insert((snp.seq.clone(), snp.pos)) {
+                                        variants.push(snp);
+                                    }
+                                }
                             }
-                            variants.push(rec);
                         }
                     }
                 }
             }
+
+            let num_major_snp = variants.iter()
+                .filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+            let num_minor_snp = variants.iter()
+                .filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
 
             //print outputs
             if args.output_pileup {
@@ -686,7 +704,7 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
+            let (first_pass_variants, _, _, fp_breadth, fp_depth) = call_variants(
                 &args,
                 output,
                 output_counts,
@@ -703,21 +721,21 @@ pub fn call(args: CallArgs) {
 
             // reconstruct indels and sequence ends unless disabled
             let (reconstructed_indels, reconstructed_ends) = if !args.indel_detection {
-                info!("Indel reconstruction disabled (--no-indels)");
+                info!("Indel reconstruction disabled (use --indels to enable)");
                 (Vec::new(), Vec::new())
             } else {
                 let infos = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
-                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64);
+                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64, args.min_kmers as u64);
                 let n_breakpoints: usize = infos.iter().map(|i| i.breakpoints.len()).sum();
                 let n_pairs: usize = merged_pairs.iter().map(|(_, p)| p.len()).sum();
-                info!("Identified {} breakpoints across {} sequences; planned {} internal indel event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
-                trace!("Planned internal indel pairs: {:?}", merged_pairs);
+                info!("Identified {} breakpoints across {} sequences; planned {} internal reconstruction event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
+                trace!("Planned internal reconstruction location pairs: {:?}", merged_pairs);
                 trace!("Planned end anchors: {:?}", end_anchors);
 
                 let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &merged_pairs, args.kmer);
-                info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+                info!("Reconstructed {} internal alleles", reconstructed_indels.len());
                 for indel in &reconstructed_indels {
-                    info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
+                    info!("  internal {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
                 }
 
                 let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
@@ -742,14 +760,14 @@ pub fn call(args: CallArgs) {
             let has_indels = !consensus_edits.is_empty();
 
             if !has_indels {
-                info!("No indels or sequence ends were reconstructed, skipping second pass of mapping");
+                info!("No internal alleles or sequence ends were reconstructed, skipping second pass of mapping");
             } else {
-                info!("Printing reconstructed consensus sequence for sample {} ({} indel/ends)", clean_sample_id(r1), consensus_edits.len());
+                info!("Printing reconstructed consensus sequence for sample {} ({} internal alleles/ends)", clean_sample_id(r1), consensus_edits.len());
             }
 
             // print the sample consensus so we can use it for the second pass (if anything was reconstructed)
             if args.output_consensus || has_indels {
-                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
+                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits);
             }
 
             // Second pass of mapping if reconstructed
@@ -801,7 +819,7 @@ pub fn call(args: CallArgs) {
             // Print the final variants. First-pass major SNVs are always carried over. If there was a second pass, the
             // the minor variants and any indels or new SNVs are also carried over and translated position-wise. Without a second pass, the first-pass
             // call is the final result as-is.
-            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
+            let (mut variants, _, _, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
                 let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
                     &args,
                     cur_output,
@@ -847,13 +865,10 @@ pub fn call(args: CallArgs) {
                     }
                 }
 
-                // recount SNVs from the merged set (indel records are added and counted separately below)
-                let num_major_snp = merged.iter().filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
-                let num_minor_snp = merged.iter().filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
-
-                (merged, num_major_snp, num_minor_snp, sp_breadth, sp_depth)
+                // SNV counts are taken from `variants` once the indel records are in
+                (merged, 0, 0, sp_breadth, sp_depth)
             } else {
-                (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth)
+                (first_pass_variants, 0, 0, fp_breadth, fp_depth)
             };
             log_memory_usage(true, "Called variants successfully");
 
@@ -862,19 +877,40 @@ pub fn call(args: CallArgs) {
             let mut num_insertions = 0;
             let mut num_deletions = 0;
             if let Some(coord_maps) = coord_maps_opt {
+                // positions already reported as SNPs, so a split block does not double-report them
+                let mut snp_seen: FxHashSet<(String, usize)> = variants
+                    .iter()
+                    .filter(|r| r.ref_allele.len() == 1 && r.alt_allele.len() == 1)
+                    .map(|r| (r.seq.clone(), r.pos))
+                    .collect();
+
                 for indel in &reconstructed_indels {
                     if let Some(coord_map) = coord_maps.get(&indel.seq) {
                         if let Some(rec) = indel_to_vcf_record(indel, output, output_rev, cur_output, cur_output_rev, coord_map) {
-                            match rec.var_type() {
-                                "INS" => num_insertions += 1,
-                                "DEL" => num_deletions += 1,
-                                _ => {}
+                            let split = split_block_substitution(&rec, coord_map, cur_output, cur_output_rev);
+                            if split.is_empty() {
+                                match rec.var_type() {
+                                    "INS" => num_insertions += 1,
+                                    "DEL" => num_deletions += 1,
+                                    _ => {}
+                                }
+                                variants.push(rec);
+                            } else {
+                                for snp in split {
+                                    if snp_seen.insert((snp.seq.clone(), snp.pos)) {
+                                        variants.push(snp);
+                                    }
+                                }
                             }
-                            variants.push(rec);
                         }
                     }
                 }
             }
+
+            let num_major_snp = variants.iter()
+                .filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+            let num_minor_snp = variants.iter()
+                .filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
 
             //print outputs
             if args.output_pileup {
@@ -1249,7 +1285,6 @@ pub fn print_consensus(
     viral_metadata: &ViralMetadata,
     best_genome_index: &u16,
     reconstructed_indels: &[ReconstructedIndel],
-    major_variants: &[VCFRecord], // first-pass called variants; the major SNVs are applied to the consensus
 ){
     info!("Writing output to pileup");
 
@@ -1269,21 +1304,24 @@ pub fn print_consensus(
         let fwd = output.get(seq).expect("Could not match seq to fwd counts");
         let rev = output_rev.get(seq).expect("Could not match seq to rev counts");
 
-        // start from the reference: keep the reference base where covered, N where there is no coverage
+        // The assembly follows the reads, never the reference: falling back to the reference base
+        // where the pileup does not support it is a misassembly, whereas an N is an honest gap.
+        // A called major variant is by definition the pileup majority, so it needs no separate pass.
         let mut consensus: Vec<u8> = Vec::with_capacity(fwd.ref_bases.len());
-        for (i, &ref_base) in fwd.ref_bases.iter().enumerate() {
-            let total_depth: u64 = (0..4).map(|b| fwd.counts[i][b] + rev.counts[i][b]).sum();
-            consensus.push(if total_depth == 0u64 { b'N' } else { ref_base });
-        }
+        for i in 0..fwd.ref_bases.len() {
+            let per: [u64; 4] = core::array::from_fn(|b| fwd.counts[i][b] + rev.counts[i][b]);
+            let total: u64 = per.iter().sum();
+            let best = (0..4).max_by_key(|&b| per[b]).unwrap();
 
-        // apply the first-pass called major variants (AF >= 0.5 substitutions) for this sequence, so the
-        // consensus only deviates from the reference at confident, filter-passing calls
-        for v in major_variants {
-            if v.seq == *seq && v.af >= 0.5 && v.ref_allele.len() == 1 && v.alt_allele.len() == 1 {
-                if v.pos >= 1 && v.pos <= consensus.len() {
-                    consensus[v.pos - 1] = v.alt_allele[0];
-                }
-            }
+            let unsupported = total == 0
+                || per[best] <= args.min_kmers as u64          // no evidence beyond the kmer floor
+                || (per[best] as f64) < 0.5 * total as f64;    // no base actually dominant
+
+            consensus.push(if unsupported {
+                b'N'
+            } else {
+                nucleotide_bits_to_char(best as u64) as u8
+            });
         }
 
         // splice the reconstructed indels for this sequence into the consensus (footprints share the
@@ -1372,8 +1410,8 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">").unwrap();
     writeln!(writer, "##INFO=<ID=DP4,Number=4,Type=Integer,Description=\"Fwd_ref,Rev_ref,Fwd_alt,Rev_alt\">").unwrap();
     writeln!(writer, "##INFO=<ID=SOR,Number=1,Type=Float,Description=\"SOR\">").unwrap();
-    writeln!(writer, "##INFO=<ID=SORMAX,Number=1,Type=Float,Description=\"Maximum SOR this variant was allowed, scaled by its read support and distance above the local noise floor (-1 if no strand test applied)\">").unwrap();
-    writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, MNV, INS, DEL)\">").unwrap();
+    writeln!(writer, "##INFO=<ID=SORMAX,Number=1,Type=Float,Description=\"SOR scaled by read support and distance from noise floor\">").unwrap();
+    writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, INS, DEL)\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
     // sort records by contig (in the order contigs are declared above) then by position, so the
@@ -1553,6 +1591,48 @@ fn indel_to_vcf_record(
         sor,
         sor_max: -1.0, // indels are not strand filtered
     })
+}
+
+// split an equal-length allele into one SNP per differing position, taking per-position depth/AF/SOR
+// from the corrected pileup and falling back to the block's numbers where it has no coverage.
+// empty for a real indel, which the caller reports as-is
+fn split_block_substitution(
+    rec: &VCFRecord,
+    coord_map: &CoordMap,
+    new_output: &DashMap<String, OutputData>,
+    new_output_rev: &DashMap<String, OutputData>,
+) -> Vec<VCFRecord> {
+    let mut out = Vec::new();
+    if rec.ref_allele.len() != rec.alt_allele.len() {
+        return out;
+    }
+
+    for (i, (&rb, &ab)) in rec.ref_allele.iter().zip(rec.alt_allele.iter()).enumerate() {
+        if rb == ab {
+            continue;
+        }
+        let orig_pos = rec.pos + i;
+        let corrected = coord_map.orig_to_corrected.get(orig_pos - 1).copied().flatten();
+        let per_pos = corrected.and_then(|c| {
+            major_snv_second_pass_record(&rec.seq, orig_pos, c, rb, ab, new_output, new_output_rev)
+        });
+
+        out.push(per_pos.unwrap_or_else(|| VCFRecord {
+            seq: rec.seq.clone(),
+            pos: orig_pos,
+            ref_allele: vec![rb],
+            alt_allele: vec![ab],
+            fwd_ref: rec.fwd_ref,
+            rev_ref: rec.rev_ref,
+            fwd_alt: rec.fwd_alt,
+            rev_alt: rec.rev_alt,
+            depth: rec.depth,
+            af: rec.af,
+            sor: rec.sor,
+            sor_max: rec.sor_max,
+        }));
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
