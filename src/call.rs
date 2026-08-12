@@ -143,6 +143,13 @@ fn check_args(args: &CallArgs) {
         warn!("Strand balance ratio is set to 1, all variants will pass this filter");
     }
 
+    if args.sor_adj_multiplier < 0.0 {
+        error!("SOR adjustment multiplier is set to below 0, must be 0.0 (no adjustment) or greater");
+        std::process::exit(1);
+    } else if args.sor_adj_multiplier == 0.0 {
+        info!("SOR adjustment multiplier set to 0, strand filtering uses a fixed cutoff of {}", args.strand_odds_max);
+    }
+
     if args.min_variant_depth < 0 {
         warn!("Minimum variant depth set below 0, all variants will be returned if passing other thresholds");
     }
@@ -402,7 +409,7 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
+            let (first_pass_variants, _, _, fp_breadth, fp_depth) = call_variants(
                 &args,
                 output,
                 output_counts,
@@ -418,22 +425,22 @@ pub fn call(args: CallArgs) {
 
 
             // reconstruct indels and sequence ends unless disabled
-            let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
-                info!("Indel reconstruction disabled (--no-indels)");
+            let (reconstructed_indels, reconstructed_ends) = if !args.indel_detection {
+                info!("Indel reconstruction disabled (use --indels to enable)");
                 (Vec::new(), Vec::new())
             } else {
                 let infos = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
-                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64);
+                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64, args.min_kmers as u64);
                 let n_breakpoints: usize = infos.iter().map(|i| i.breakpoints.len()).sum();
                 let n_pairs: usize = merged_pairs.iter().map(|(_, p)| p.len()).sum();
-                info!("Identified {} breakpoints across {} sequences; planned {} internal indel event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
-                trace!("Planned internal indel pairs: {:?}", merged_pairs);
+                info!("Identified {} breakpoints across {} sequences; planned {} internal reconstruction event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
+                trace!("Planned internal reconstruction location pairs: {:?}", merged_pairs);
                 trace!("Planned end anchors: {:?}", end_anchors);
 
                 let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &merged_pairs, args.kmer);
-                info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+                info!("Reconstructed {} internal alleles", reconstructed_indels.len());
                 for indel in &reconstructed_indels {
-                    info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
+                    info!("  internal {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
                 }
 
                 let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
@@ -458,14 +465,14 @@ pub fn call(args: CallArgs) {
             let has_indels = !consensus_edits.is_empty();
 
             if !has_indels {
-                info!("No indels or sequence ends were reconstructed, skipping second pass of mapping");
+                info!("No internal alleles or sequence ends were reconstructed, skipping second pass of mapping");
             } else {
-                info!("Printing reconstructed consensus sequence for sample {} ({} indel/ends)", clean_sample_id(se_read), consensus_edits.len());
+                info!("Printing reconstructed consensus sequence for sample {} ({} internal alleles/ends)", clean_sample_id(se_read), consensus_edits.len());
             }
 
             // print the sample consensus so we can use it for the second pass (if anything was reconstructed)
             if args.output_consensus || has_indels {
-                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
+                print_consensus(&se_read, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits);
             }
 
             // Second pass of mapping if reconstructed
@@ -514,7 +521,7 @@ pub fn call(args: CallArgs) {
             // Print the final variants. First-pass major SNVs are always carried over. If there was a second pass, the
             // the minor variants and any indels or new SNVs are also carried over and translated position-wise. Without a second pass, the first-pass
             // call is the final result as-is.
-            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
+            let (mut variants, _, _, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
                 let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
                     &args,
                     cur_output,
@@ -560,13 +567,10 @@ pub fn call(args: CallArgs) {
                     }
                 }
 
-                // recount SNVs from the merged set (indel records are added and counted separately below)
-                let num_major_snp = merged.iter().filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
-                let num_minor_snp = merged.iter().filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
-
-                (merged, num_major_snp, num_minor_snp, sp_breadth, sp_depth)
+                // SNV counts are taken from `variants` once the indel records are in
+                (merged, 0, 0, sp_breadth, sp_depth)
             } else {
-                (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth)
+                (first_pass_variants, 0, 0, fp_breadth, fp_depth)
             };
             log_memory_usage(true, "Called variants successfully");
 
@@ -575,19 +579,40 @@ pub fn call(args: CallArgs) {
             let mut num_insertions = 0;
             let mut num_deletions = 0;
             if let Some(coord_maps) = coord_maps_opt {
+                // positions already reported as SNPs, so a split block does not double-report them
+                let mut snp_seen: FxHashSet<(String, usize)> = variants
+                    .iter()
+                    .filter(|r| r.ref_allele.len() == 1 && r.alt_allele.len() == 1)
+                    .map(|r| (r.seq.clone(), r.pos))
+                    .collect();
+
                 for indel in &reconstructed_indels {
                     if let Some(coord_map) = coord_maps.get(&indel.seq) {
                         if let Some(rec) = indel_to_vcf_record(indel, output, output_rev, cur_output, cur_output_rev, coord_map) {
-                            match rec.var_type() {
-                                "INS" => num_insertions += 1,
-                                "DEL" => num_deletions += 1,
-                                _ => {}
+                            let split = split_block_substitution(&rec, coord_map, cur_output, cur_output_rev);
+                            if split.is_empty() {
+                                match rec.var_type() {
+                                    "INS" => num_insertions += 1,
+                                    "DEL" => num_deletions += 1,
+                                    _ => {}
+                                }
+                                variants.push(rec);
+                            } else {
+                                for snp in split {
+                                    if snp_seen.insert((snp.seq.clone(), snp.pos)) {
+                                        variants.push(snp);
+                                    }
+                                }
                             }
-                            variants.push(rec);
                         }
                     }
                 }
             }
+
+            let num_major_snp = variants.iter()
+                .filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+            let num_minor_snp = variants.iter()
+                .filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
 
             //print outputs
             if args.output_pileup {
@@ -679,7 +704,7 @@ pub fn call(args: CallArgs) {
                 std::process::exit(1);
             });
 
-            let (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth) = call_variants(
+            let (first_pass_variants, _, _, fp_breadth, fp_depth) = call_variants(
                 &args,
                 output,
                 output_counts,
@@ -695,22 +720,22 @@ pub fn call(args: CallArgs) {
 
 
             // reconstruct indels and sequence ends unless disabled
-            let (reconstructed_indels, reconstructed_ends) = if args.no_indels {
-                info!("Indel reconstruction disabled (--no-indels)");
+            let (reconstructed_indels, reconstructed_ends) = if !args.indel_detection {
+                info!("Indel reconstruction disabled (use --indels to enable)");
                 (Vec::new(), Vec::new())
             } else {
                 let infos = identify_indel_breakpoints(output, output_rev, args.indel_max_ratio, args.indel_min_depth as u64, args.indel_max_drop_depth as u64, args.indel_width);
-                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64);
+                let (merged_pairs, end_anchors) = plan_indel_events(&infos, args.kmer, args.indel_min_depth as u64, args.min_kmers as u64);
                 let n_breakpoints: usize = infos.iter().map(|i| i.breakpoints.len()).sum();
                 let n_pairs: usize = merged_pairs.iter().map(|(_, p)| p.len()).sum();
-                info!("Identified {} breakpoints across {} sequences; planned {} internal indel event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
-                trace!("Planned internal indel pairs: {:?}", merged_pairs);
+                info!("Identified {} breakpoints across {} sequences; planned {} internal reconstruction event(s) and {} end handoff(s)", n_breakpoints, infos.len(), n_pairs, end_anchors.len());
+                trace!("Planned internal reconstruction location pairs: {:?}", merged_pairs);
                 trace!("Planned end anchors: {:?}", end_anchors);
 
                 let reconstructed_indels = reconstruct_indels(output, &flanking_base_map, &merged_pairs, args.kmer);
-                info!("Reconstructed {} indel alleles", reconstructed_indels.len());
+                info!("Reconstructed {} internal alleles", reconstructed_indels.len());
                 for indel in &reconstructed_indels {
-                    info!("  indel {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
+                    info!("  internal {}:{}-{} (ref {}-{}) allele: {}", indel.seq, indel.drop_pos, indel.rise_pos, indel.ref_start, indel.ref_end, String::from_utf8_lossy(&indel.allele));
                 }
 
                 let reconstructed_ends = reconstruct_ends(output, output_rev, &flanking_base_map, args.kmer, args.indel_min_depth as u64, &end_anchors);
@@ -735,14 +760,14 @@ pub fn call(args: CallArgs) {
             let has_indels = !consensus_edits.is_empty();
 
             if !has_indels {
-                info!("No indels or sequence ends were reconstructed, skipping second pass of mapping");
+                info!("No internal alleles or sequence ends were reconstructed, skipping second pass of mapping");
             } else {
-                info!("Printing reconstructed consensus sequence for sample {} ({} indel/ends)", clean_sample_id(r1), consensus_edits.len());
+                info!("Printing reconstructed consensus sequence for sample {} ({} internal alleles/ends)", clean_sample_id(r1), consensus_edits.len());
             }
 
             // print the sample consensus so we can use it for the second pass (if anything was reconstructed)
             if args.output_consensus || has_indels {
-                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits, &first_pass_variants);
+                print_consensus(&r1, &args, &output, &output_rev, &viral_metadata, &best_genome_index, &consensus_edits);
             }
 
             // Second pass of mapping if reconstructed
@@ -794,7 +819,7 @@ pub fn call(args: CallArgs) {
             // Print the final variants. First-pass major SNVs are always carried over. If there was a second pass, the
             // the minor variants and any indels or new SNVs are also carried over and translated position-wise. Without a second pass, the first-pass
             // call is the final result as-is.
-            let (mut variants, num_major_snp, num_minor_snp, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
+            let (mut variants, _, _, breadth_cov, depth_cov) = if let Some(coord_maps) = coord_maps_opt {
                 let (sp_variants, _sp_major, _sp_minor, sp_breadth, sp_depth) = call_variants(
                     &args,
                     cur_output,
@@ -840,13 +865,10 @@ pub fn call(args: CallArgs) {
                     }
                 }
 
-                // recount SNVs from the merged set (indel records are added and counted separately below)
-                let num_major_snp = merged.iter().filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
-                let num_minor_snp = merged.iter().filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
-
-                (merged, num_major_snp, num_minor_snp, sp_breadth, sp_depth)
+                // SNV counts are taken from `variants` once the indel records are in
+                (merged, 0, 0, sp_breadth, sp_depth)
             } else {
-                (first_pass_variants, fp_major, fp_minor, fp_breadth, fp_depth)
+                (first_pass_variants, 0, 0, fp_breadth, fp_depth)
             };
             log_memory_usage(true, "Called variants successfully");
 
@@ -855,19 +877,40 @@ pub fn call(args: CallArgs) {
             let mut num_insertions = 0;
             let mut num_deletions = 0;
             if let Some(coord_maps) = coord_maps_opt {
+                // positions already reported as SNPs, so a split block does not double-report them
+                let mut snp_seen: FxHashSet<(String, usize)> = variants
+                    .iter()
+                    .filter(|r| r.ref_allele.len() == 1 && r.alt_allele.len() == 1)
+                    .map(|r| (r.seq.clone(), r.pos))
+                    .collect();
+
                 for indel in &reconstructed_indels {
                     if let Some(coord_map) = coord_maps.get(&indel.seq) {
                         if let Some(rec) = indel_to_vcf_record(indel, output, output_rev, cur_output, cur_output_rev, coord_map) {
-                            match rec.var_type() {
-                                "INS" => num_insertions += 1,
-                                "DEL" => num_deletions += 1,
-                                _ => {}
+                            let split = split_block_substitution(&rec, coord_map, cur_output, cur_output_rev);
+                            if split.is_empty() {
+                                match rec.var_type() {
+                                    "INS" => num_insertions += 1,
+                                    "DEL" => num_deletions += 1,
+                                    _ => {}
+                                }
+                                variants.push(rec);
+                            } else {
+                                for snp in split {
+                                    if snp_seen.insert((snp.seq.clone(), snp.pos)) {
+                                        variants.push(snp);
+                                    }
+                                }
                             }
-                            variants.push(rec);
                         }
                     }
                 }
             }
+
+            let num_major_snp = variants.iter()
+                .filter(|r| r.af >= 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
+            let num_minor_snp = variants.iter()
+                .filter(|r| r.af < 0.5 && r.ref_allele.len() == 1 && r.alt_allele.len() == 1).count();
 
             //print outputs
             if args.output_pileup {
@@ -1242,7 +1285,6 @@ pub fn print_consensus(
     viral_metadata: &ViralMetadata,
     best_genome_index: &u16,
     reconstructed_indels: &[ReconstructedIndel],
-    major_variants: &[VCFRecord], // first-pass called variants; the major SNVs are applied to the consensus
 ){
     info!("Writing output to pileup");
 
@@ -1262,21 +1304,24 @@ pub fn print_consensus(
         let fwd = output.get(seq).expect("Could not match seq to fwd counts");
         let rev = output_rev.get(seq).expect("Could not match seq to rev counts");
 
-        // start from the reference: keep the reference base where covered, N where there is no coverage
+        // The assembly follows the reads, never the reference: falling back to the reference base
+        // where the pileup does not support it is a misassembly, whereas an N is an honest gap.
+        // A called major variant is by definition the pileup majority, so it needs no separate pass.
         let mut consensus: Vec<u8> = Vec::with_capacity(fwd.ref_bases.len());
-        for (i, &ref_base) in fwd.ref_bases.iter().enumerate() {
-            let total_depth: u64 = (0..4).map(|b| fwd.counts[i][b] + rev.counts[i][b]).sum();
-            consensus.push(if total_depth == 0u64 { b'N' } else { ref_base });
-        }
+        for i in 0..fwd.ref_bases.len() {
+            let per: [u64; 4] = core::array::from_fn(|b| fwd.counts[i][b] + rev.counts[i][b]);
+            let total: u64 = per.iter().sum();
+            let best = (0..4).max_by_key(|&b| per[b]).unwrap();
 
-        // apply the first-pass called major variants (AF >= 0.5 substitutions) for this sequence, so the
-        // consensus only deviates from the reference at confident, filter-passing calls
-        for v in major_variants {
-            if v.seq == *seq && v.af >= 0.5 && v.ref_allele.len() == 1 && v.alt_allele.len() == 1 {
-                if v.pos >= 1 && v.pos <= consensus.len() {
-                    consensus[v.pos - 1] = v.alt_allele[0];
-                }
-            }
+            let unsupported = total == 0
+                || per[best] <= args.min_kmers as u64          // no evidence beyond the kmer floor
+                || (per[best] as f64) < 0.5 * total as f64;    // no base actually dominant
+
+            consensus.push(if unsupported {
+                b'N'
+            } else {
+                nucleotide_bits_to_char(best as u64) as u8
+            });
         }
 
         // splice the reconstructed indels for this sequence into the consensus (footprints share the
@@ -1364,8 +1409,9 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Total Depth\">").unwrap();
     writeln!(writer, "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">").unwrap();
     writeln!(writer, "##INFO=<ID=DP4,Number=4,Type=Integer,Description=\"Fwd_ref,Rev_ref,Fwd_alt,Rev_alt\">").unwrap();
-    writeln!(writer, "##INFO=<ID=SOR,Number=4,Type=Float,Description=\"SOR\">").unwrap();
-    writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, MNV, INS, DEL)\">").unwrap();
+    writeln!(writer, "##INFO=<ID=SOR,Number=1,Type=Float,Description=\"SOR\">").unwrap();
+    writeln!(writer, "##INFO=<ID=SOR_ADJ,Number=1,Type=Float,Description=\"SOR discounted by read support and distance from the noise floor\">").unwrap();
+    writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, INS, DEL)\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
     // sort records by contig (in the order contigs are declared above) then by position, so the
@@ -1385,7 +1431,7 @@ pub fn print_output(
 
     for variant in sorted{
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
-        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};TYPE={}",
+        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};SOR_ADJ={:.3};TYPE={}",
             seq_out,
             variant.pos,
             String::from_utf8_lossy(&variant.ref_allele),
@@ -1394,6 +1440,7 @@ pub fn print_output(
             variant.af,
             variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt,
             variant.sor,
+            variant.sor_adjusted,
             variant.var_type()
         ).unwrap()
     }
@@ -1411,7 +1458,8 @@ pub struct VCFRecord{
     rev_alt: u64,
     depth: u64,
     af: f64,
-    sor: f64
+    sor: f64,
+    sor_adjusted: f64 // SOR after its evidence discount, the value tested against the cutoff (-1.0 where no strand test runs)
 }
 
 impl VCFRecord {
@@ -1427,15 +1475,7 @@ impl VCFRecord {
     }
 }
 
-// Build a VCF record for a reconstructed indel. REF is the original-reference footprint the allele
-// replaced and ALT is the reconstructed allele. The two alleles drop out of opposite pileups, so each
-// is measured where it maps cleanly: the REF allele (reads without the indel) from the first-pass
-// pileup over the disrupted footprint, and the ALT allele (reads with the indel) from the second-pass
-// (corrected consensus) pileup over the spliced-in allele. Each side takes the weakest (minimum total
-// depth) position across its span, which lands in the disrupted region rather than the well-covered
-// anchors. Those per-strand counts give DP4, AF, DP and the strand odds ratio. The shared flanks are
-// then trimmed to a single anchor base and the start is reported in the original reference. Returns
-// None if the indel can't be located/translated (e.g. footprint out of range or abutting another indel).
+// Build a VCF record for a reconstructed indel. 
 fn indel_to_vcf_record(
     indel: &ReconstructedIndel,
     orig_output: &DashMap<String, OutputData>,
@@ -1455,6 +1495,9 @@ fn indel_to_vcf_record(
             return None;
         }
         let ref_allele = orig.ref_bases[indel.ref_start - 1..indel.ref_end].to_vec();
+        if !is_acgt(&ref_allele) {
+            return None;
+        }
 
         let mut rep = indel.ref_start - 1;
         let mut min_total = u64::MAX;
@@ -1483,6 +1526,9 @@ fn indel_to_vcf_record(
         let rev = new_output_rev.get(&indel.seq)?;
         let c_end = (c_start + indel.allele.len()).min(fwd.counts.len());
         if c_start >= c_end {
+            return None;
+        }
+        if !is_acgt(&fwd.ref_bases[c_start..c_end]) {
             return None;
         }
         let mut rep = c_start;
@@ -1543,7 +1589,50 @@ fn indel_to_vcf_record(
         depth,
         af,
         sor,
+        sor_adjusted: -1.0, // indels are not strand filtered
     })
+}
+
+// split an equal-length allele into one SNP per differing position, taking per-position depth/AF/SOR
+// from the corrected pileup and falling back to the block's numbers where it has no coverage.
+// empty for a real indel, which the caller reports as-is
+fn split_block_substitution(
+    rec: &VCFRecord,
+    coord_map: &CoordMap,
+    new_output: &DashMap<String, OutputData>,
+    new_output_rev: &DashMap<String, OutputData>,
+) -> Vec<VCFRecord> {
+    let mut out = Vec::new();
+    if rec.ref_allele.len() != rec.alt_allele.len() {
+        return out;
+    }
+
+    for (i, (&rb, &ab)) in rec.ref_allele.iter().zip(rec.alt_allele.iter()).enumerate() {
+        if rb == ab {
+            continue;
+        }
+        let orig_pos = rec.pos + i;
+        let corrected = coord_map.orig_to_corrected.get(orig_pos - 1).copied().flatten();
+        let per_pos = corrected.and_then(|c| {
+            major_snv_second_pass_record(&rec.seq, orig_pos, c, rb, ab, new_output, new_output_rev)
+        });
+
+        out.push(per_pos.unwrap_or_else(|| VCFRecord {
+            seq: rec.seq.clone(),
+            pos: orig_pos,
+            ref_allele: vec![rb],
+            alt_allele: vec![ab],
+            fwd_ref: rec.fwd_ref,
+            rev_ref: rec.rev_ref,
+            fwd_alt: rec.fwd_alt,
+            rev_alt: rec.rev_alt,
+            depth: rec.depth,
+            af: rec.af,
+            sor: rec.sor,
+            sor_adjusted: rec.sor_adjusted,
+        }));
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -1559,7 +1648,7 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
     //window size and alppa, max table size for our streaming version of thompson tau
     let window_size = 100;
     let alpha = 0.001;
-    let max_table_len = window_size / 10;
+    let max_table_len = window_size / 5;
 
     let len = fwd.counts.len();
     
@@ -1691,7 +1780,7 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             // if not, set the baseline noise at i to curr_mu, curr_var, curr_max
             if (candidate_outlier as f64 - curr_mu).abs() > tau * std {
                 curr_s -= candidate_outlier;
-                curr_s2 -= candidate_outlier;
+                curr_s2 -=  candidate_outlier * candidate_outlier;
                 curr_n -= 1;
                 if curr_n > 0 {
                     curr_mu = curr_s as f64 / curr_n as f64;
@@ -1712,7 +1801,7 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             let write_idx = i - half_window;
             if write_idx < len {
                 baseline_noise[write_idx] = Noise{
-                    max: maxes[curr_max_idx],
+                    max: maxes.get(curr_max_idx).copied().unwrap_or(0.0),
                     mean: curr_mu,
                     std: curr_var.sqrt()
                 };
@@ -1782,6 +1871,7 @@ fn major_snv_second_pass_record(
         depth: total_depth,
         af,
         sor,
+        sor_adjusted: -1.0, // major variants are not strand filtered
     })
 }
 
@@ -1820,10 +1910,6 @@ pub fn call_variants(
         let rev_counts = output_rev_count.get(seq).expect("Missing rev counts");
 
         let baseline_noise: Vec<Noise> = get_baseline_noise(&*fwd, &*rev);
-
-        // for i in 100..120 {
-        //     info!("{}", baseline_noise[i].mean);
-        // }
 
         let len = fwd.counts.len();
         let mut start = 0;
@@ -1887,8 +1973,31 @@ pub fn call_variants(
                     continue;
                 }
 
+                //Compute af and minor noise multiplier threshold for future use
+                let alt_count = row_total[alt_base as usize];
+                let af = alt_count as f64 / total_depth as f64;
+
+                let y0: f64 = args.variant_multiplier;
+                let p0: f64 = 0.5;
+                let decay: f64 = 0.03;
+                let factor = y0 + p0 * decay.powf(100.0 * af);
+                let noise_threshold = factor.max(y0) * baseline_noise[i].max;
+
+
+                // how much strand skew this variant has earned. You have more confidence in a variant with a
+                // ton of read support even if it is skewed to one strand, so discount its SOR by the evidence
+                // behind it: read support times how far the af sits above the local noise. Capped at the
+                // cutoff, so a well-supported variant comes down from 16 to 8 but no further
+                let mut sor_discount = 0.0;
+                if args.sor_adj_multiplier > 0.0 && noise_threshold > 0.0 && af > noise_threshold {
+                    let above_noise = (af / noise_threshold).log10().clamp(0.0, 1.0);
+                    let support = (alt_count as f64).max(1.0).log10();
+                    sor_discount = (args.sor_adj_multiplier * support * above_noise).min(args.strand_odds_max);
+                }
+
                 // NEW Strand filter logic
                 let mut sor = args.strand_odds_max + 1.0; //default is above the given so filtered if not able to calculate
+                let mut sor_adjusted = sor;
                 if strand_filter {
                     let a = row[ref_base as usize] as f64 + 1.0; //ref fwd
                     let b = row_rev[ref_base as usize] as f64 + 1.0; //ref rev
@@ -1900,15 +2009,16 @@ pub fn call_variants(
                     let min_strand_depth = (a+c).min(b+d);
                     let min_strand_percent = min_strand_depth / ref_total;
 
-                    //if the strand balance filter is on (default), then always do SOR filter
-                    //if the strand balance filter is off, then only do SOR filter when 1 strand is > strand_balance_ratio of total depth (by default 10% of total depth, aka all cases where 1 strand is less than 10% of the total depth are ignored)
-                    if (!args.no_strand_balance_filter) | ((args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) {
+                    //if the strand balance filter is off, then always do SOR filter
+                    //if the strand balance filter is on (default), then only do SOR filter when 1 strand is > strand_balance_ratio of total depth (by default 10% of total depth, aka all cases where 1 strand is less than 10% of the total depth are ignored)
+                    if (args.no_strand_balance_filter) | ((!args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) {
 
                         //Using GATK strand odds ratio
                         sor = strand_odds_ratio(row[ref_base as usize], row_rev[ref_base as usize], row[alt_base as usize], row_rev[alt_base as usize]);
+                        sor_adjusted = sor - sor_discount;
 
-                        // filter out if greater than strand odds ratio (default 8)
-                        if sor > args.strand_odds_max {
+                        // filter out if the discounted strand odds ratio is still over the cutoff
+                        if sor_adjusted > args.strand_odds_max {
                             continue;
                         }
 
@@ -1921,19 +2031,12 @@ pub fn call_variants(
                         }
                     } else {
                         sor = -1.0; //output SOR == -1.0 if the strand is unbalanced so not tested
+                        sor_adjusted = -1.0;
                     }
                 }
 
-                //Get minor af (filter out if below reporting threshold)
-                let alt_count = row_total[alt_base as usize];
-                let af = alt_count as f64 / total_depth as f64;
-                
-                let y0: f64 = args.variant_multiplier;
-                let p0: f64 = 0.5;
-                let a: f64 = 0.03;
-                let factor = y0 + p0 * a.powf(100.0 * af);
-
-                if af < min_af || af < (factor.max(y0) * baseline_noise[i].max) {
+                //filter out if below the reporting threshold or inside the local noise
+                if af < min_af || af < noise_threshold {
                     continue;
                 }
 
@@ -1962,7 +2065,8 @@ pub fn call_variants(
                     rev_alt: row_rev[alt_base as usize],
                     depth: total_depth,
                     af: af,
-                    sor: sor
+                    sor: sor,
+                    sor_adjusted: if strand_filter { sor_adjusted } else { -1.0 }
                 })
 
             }
@@ -2162,7 +2266,7 @@ pub fn map_kmers(
                     if args.n_fixed * 2 + 1 >= len {
                         (0, 0)
                     } else {
-                        (args.n_fixed, len - args.n_fixed - 1)
+                        (args.n_fixed, len - args.n_fixed)
                     }
                 };
                 buckets[start..end].iter().enumerate()
@@ -2185,13 +2289,14 @@ pub fn map_kmers(
 
                         let genome_pos = info.location as usize;
                         let nuc_x = info.idx as usize;
-                        let idx = genome_pos + nuc_x;
+                        // let idx = genome_pos + nuc_x;
+                        let idx = genome_pos + (if info.canonical { k - nuc_x - 1 } else { nuc_x });
                         let key: SeqKey = (info.file_id, info.seq_id);
 
-                        if info.canonical {
-                            // pos = k - nuc_x - 1, so k - pos - 1 = nuc_x
-                            let bit_idx = (((kmer_bin >> (2 * nuc_x)) & 0b11) ^ 0b11) as usize;
-                            if rc {
+                        if info.canonical { //if the reference kmer is represented canonically 
+                            // canonical index nuc_x is forward offset k-nuc_x-1, complemented; idx mirrors to match
+                            let bit_idx = (((kmer_bin >> (2 * (k - nuc_x - 1))) & 0b11) ^ 0b11) as usize; //extracts the reverse complement of the base at position nuc_x
+                            if rc { //if the query kmer is reverse complemented
                                 local_fwd_sum.entry(key).or_default().entry(idx).or_insert([0u64; 4])[bit_idx] += 1;
                                 let e = local_fwd_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
                                 if e[bit_idx] < *n { e[bit_idx] = *n; }
@@ -2200,10 +2305,10 @@ pub fn map_kmers(
                                 let e = local_rev_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
                                 if e[bit_idx] < *n { e[bit_idx] = *n; }
                             }
-                        } else {
+                        } else { //if the reference kmer is represented as itself (not canonically)
                             // pos = nuc_x, so k - pos - 1 = k - nuc_x - 1
-                            let bit_idx = ((kmer_bin >> (2 * (k - nuc_x - 1))) & 0b11) as usize;
-                            if rc {
+                            let bit_idx = ((kmer_bin >> (2 * (k - nuc_x - 1))) & 0b11) as usize; //extracts the base at position nuc_x
+                            if rc { //if the query kmer is reverse complemented
                                 local_rev_sum.entry(key).or_default().entry(idx).or_insert([0u64; 4])[bit_idx] += 1;
                                 let e = local_rev_max.entry(key).or_default().entry(idx).or_insert([0u64; 4]);
                                 if e[bit_idx] < *n { e[bit_idx] = *n; }

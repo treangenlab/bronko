@@ -130,8 +130,12 @@ pub struct CallArgs {
     #[clap(long="n-per-strand", default_value_t = DEFAULT_N_KMERS_PER_STRAND, help_heading="VARIANT CALLING PARAMETERS", help="Min number of unique kmers to observe to call a variant at any site (needed on both strands if strand filter active)")]
     pub n_per_strand: usize,
 
-    #[clap(long="strand_odds", default_value_t = DEFAULT_MAX_STRAND_ODDS, help_heading="VARIANT CALLING PARAMETERS", help="Maximum strand odds ratio for a variant to pass strand filtering")]
+    #[clap(long="strand_odds", default_value_t = DEFAULT_MAX_STRAND_ODDS, help_heading="VARIANT CALLING PARAMETERS", help="Maximum strand odds ratio for a variant to pass strand filtering, tested against SOR_adjusted (see --sor-adj-multiplier)")]
     pub strand_odds_max: f64,
+
+    //how fast the allowed strand odds ratio grows with the evidence behind a variant
+    #[clap(long="sor-adj-multiplier", default_value_t = DEFAULT_SOR_ADJ_MULTIPLIER, help_heading="VARIANT CALLING PARAMETERS", help="How much a variant's strand odds ratio is discounted with 10x of reads supporting it, for a variant sitting a decade above the local noise floor (see docs for full details))")]
+    pub sor_adj_multiplier: f64,
 
     //min depth to call a variant
     #[clap(long="min-depth", default_value_t = DEFAULT_MIN_DEPTH, help_heading="VARIANT CALLING PARAMETERS", help="Minimum total depth at an allele to call a minor variant (default=100*min_kmers)")]
@@ -146,9 +150,9 @@ pub struct CallArgs {
     pub variant_multiplier: f64,
 
     //INDEL PARAMETERS
-    //disable indel reconstruction entirely (consensus will not contain indels)
-    #[clap(long="no-indels", default_value_t = DEFAULT_NO_INDELS, help_heading="INDEL DETECTION", help="Disable indel detection and reconstruction (the consensus sequence will not contain indels)")]
-    pub no_indels: bool,
+    //enable indel reconstruction (consensus will contain indels)
+    #[clap(long="indels", default_value_t = DEFAULT_INDEL_DETECTION, help_heading="INDEL DETECTION", help="Enable indel detection and reconstruction (the consensus sequence will contain indels)")]
+    pub indel_detection: bool,
 
     //max ratio of low/high total depth between neighbors to flag a breakpoint
     #[clap(long="indel-max-ratio", default_value_t = DEFAULT_INDEL_MAX_RATIO, help_heading="INDEL DETECTION", help="Flag an indel breakpoint when min/max total depth between two neighboring positions falls below this ratio (a sharp coverage cliff)")]
@@ -197,6 +201,7 @@ pub struct CallArgs {
     #[clap(long = "verbose", help = "Verbose output (warning: very verbose)")]
     pub verbose: bool,
 }
+
 
 pub fn parse_args() -> Cli {
     Cli::parse()
