@@ -23,7 +23,6 @@ pub struct Cli {
 pub enum Mode {
     Build(BuildArgs), //Build --> parses a genome(s) and builds the data strucutre that we want to map to later
     Call(CallArgs), //Call --> takes the genomes and sequencing data and does the viral variation analysis
-    Align(AlignArgs), //Align --> takes genomes and builds a reference-free alignment using buckets alone
 }
 
 #[derive(Args, Default)]
@@ -203,31 +202,6 @@ pub struct CallArgs {
     pub verbose: bool,
 }
 
-#[derive(Args)]
-#[clap(about="Align reference genomes without the use of formal MSA", arg_required_else_help = true)]
-pub struct AlignArgs {
-
-    // INPUT
-    #[clap(num_args=1.., short='g', long = "genomes", help_heading = "INPUT", help = "Genome fasta(.gz) files to use as references (bronko build will be called)")]
-    pub genomes: Vec<String>,
-
-    // ALGORITHM PARAMETERS
-    // the kmer size
-    #[clap(short, long="kmer-size", default_value_t = DEFAULT_KMER_SIZE, help_heading="ALGORITHM", help="Kmer size used for analysis")]
-    pub kmer: usize,
-
-    //Number of threads
-    #[clap(short, long="threads", default_value_t=4, help="Number of threads")]
-    pub threads: usize,
-
-    //Debug mode
-    #[clap(long = "debug", help = "Debug output")]
-    pub debug: bool,
-
-    //Verbose mode (prints most checkpoints)
-    #[clap(long = "verbose", help = "Verbose output (warning: very verbose)")]
-    pub verbose: bool,
-}
 
 pub fn parse_args() -> Cli {
     Cli::parse()
