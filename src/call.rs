@@ -26,6 +26,8 @@ use std::process::{Command, Stdio};
 use std::cmp::max;
 
 use statrs::distribution::{StudentsT, ContinuousCDF};
+use rand_distr::{Distribution, Poisson};
+
 
 fn check_args(args: &CallArgs) {
     let output_level;
@@ -152,6 +154,16 @@ fn check_args(args: &CallArgs) {
 
     if args.min_variant_depth < 0 {
         warn!("Minimum variant depth set below 0, all variants will be returned if passing other thresholds");
+    }
+
+    if args.sequencing_error_rate < 0.0 {
+        error!("Sequencing error rate is set to below 0, must be between 0.0 and 1.0");
+        std::process::exit(1);
+    } else if args.sequencing_error_rate > 1.0 {
+        error!("Sequencing error rate is set above 1, must be between 0.0 and 1.0");
+        std::process::exit(1);
+    } else if args.sequencing_error_rate >= 0.05 {
+        warn!("Sequencing error rate is set to above 5%, please verify this is correct (default is 0.5%)");
     }
 
     if args.min_depth < 0 {
@@ -1643,7 +1655,7 @@ pub struct Noise{
 }
 
 
-pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
+pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData, sequencing_error: f64, min_kmers: usize) -> Vec<Noise> {
 
     //window size and alppa, max table size for our streaming version of thompson tau
     let window_size = 100;
@@ -1656,11 +1668,12 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
     let mut baseline_noise = vec![Noise {max: 0.0, mean: 0.0, std: 0.0}; len];
 
     //storing the counts in the window (since max 3 alternative nucleotides the length is 3 * window length, which we can index based off of genome_pos % window_size)
-    //we also keep in_max which is 0 or 1 depending on if it is in the max table
-    let mut window_counts = vec![0.0; len*3];
-    let mut in_max = vec![0; len*3];
+    //we also keep occupied to know which slots currently hold a value from the window
+    let mut window_counts = vec![0.0; window_size*3];
+    let mut occupied = vec![false; window_size*3];
 
-    let mut maxes = vec![0.0; max_table_len];
+    //max table holds (value, slot idx) so entries are located exactly instead of by float equality
+    let mut maxes: Vec<(f64, usize)> = vec![(0.0, usize::MAX); max_table_len];
 
     let mut n:usize = 0; //number of variant positions in the window (between 0-3*len)
     let mut s:f64 = 0.0; //sum of the variant positions
@@ -1670,26 +1683,75 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
 
     let half_window = window_size / 2;
 
+    let mut rng = rand::rng(); // get rng for poisson generator
+
     for i in 0..(len + half_window) {
 
         let base_pos = (i % window_size) * 3;
         
-        
-        let freqs: Vec<f64> = if i < len {
+        let (counts, freqs, total_depth, major_count, non_zero_count, non_zero_sum) = if i < len {
             // Combine counts across strands
             let mut counts: Vec<u64> = (0..4)
                 .map(|b| fwd.counts[i][b] + rev.counts[i][b])
                 .collect();
+
+            // Sort major to minor
             counts.sort_unstable_by(|a, b| b.cmp(a));
-            let total_depth: u64 = counts.iter().sum();
-            if total_depth == 0 {
+
+            let total_depth: u64 = counts.iter().sum(); //total depth at position
+
+            let freqs: Vec<f64> = if total_depth == 0 { // get the frequencies
                 vec![0.0; 4]
             } else {
-                counts.iter().map(|&c| c as f64 / total_depth as f64).collect()
-            }
+                counts
+                    .iter()
+                    .map(|&c| c as f64 / total_depth as f64)
+                    .collect()
+            };
+
+            let major_count = counts[0]; //the major allele at that position
+
+            let non_zero_count = counts[1..] //get non-zero counts and sum for imputation of missing values
+                .iter()
+                .filter(|&&c| c > 0)
+                .count();
+
+            let non_zero_sum: u64 = counts[1..]
+                .iter()
+                .filter(|&&c| c > 0)
+                .sum();
+
+            (counts, freqs, total_depth, major_count, non_zero_count, non_zero_sum)
         } else {
-            vec![0.0; 4]
+            (vec![0; 4], vec![0.0; 4], 0, 0, 0, 0)
         };
+
+        //Get the expected error rate and lambda if there are zeros as minor alleles
+        let lambda = {
+            let total_expected_error = sequencing_error * major_count as f64;
+            let expected_per_minor: f64 = total_expected_error / 3.0; //divide by 3 for the 3 minor alleles
+
+            let observed_excess =
+                (non_zero_sum as f64 - non_zero_count as f64 * expected_per_minor).max(0.0);
+
+            let remaining_error =
+                (total_expected_error - observed_excess).max(0.0);
+
+            let n_zero = 3 - non_zero_count;
+
+            if n_zero > 0 {
+                remaining_error / n_zero as f64
+            } else {
+                0.0
+            }
+        };
+
+        let poisson = if lambda > 0.0 {
+            Some(Poisson::new(lambda).unwrap())
+        } else {
+            None
+        };
+
 
         //loop through minor variants for that position and update n, s, s2
         for j in 1..4 {
@@ -1697,57 +1759,65 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             let idx = base_pos + (j - 1);
 
             //remove the old values
-            let old = window_counts[idx];
-            if old > 0.0 {
+            if occupied[idx] {
+                let old = window_counts[idx];
                 n -= 1;
                 s -= old;
                 s2 -= old * old;
 
-                //remove from max if there
-                if in_max[idx] == 1 {
-                    //remove from maxes table and shift others up
-                    if let Some(pos) = maxes.iter().position(|&x| (x - old).abs() < 1e-12) {
-                        for k in pos..(max_table_len - 1) {
-                            maxes[k] = maxes[k+1];
-                        }
-                        maxes[max_table_len - 1] = 0.0;
+                //remove from maxes table if there and shift others up
+                if let Some(pos) = maxes.iter().position(|&(_, m)| m == idx) {
+                    for k in pos..(max_table_len - 1) {
+                        maxes[k] = maxes[k+1];
                     }
-                    in_max[idx] = 0;
+                    maxes[max_table_len - 1] = (0.0, usize::MAX);
                 }
-            }
 
-            //update with new values
-            let maf = freqs[j];
-            if maf > 0.0 {
-                n += 1;
-                s += maf;
-                s2 += maf * maf;
-
-                //loop through max table from bottom and update
-                for k in (0..max_table_len).rev() {
-                    if maf > maxes[k] {
-                        if k + 1 < max_table_len {
-                            maxes[k + 1] = maxes[k];
-                        }
-                        maxes[k] = maf;
-                    } else {
-                        break;
-                    }
-                }
-                in_max[idx] = 1;
-            } else {
-                in_max[idx] = 0;
+                occupied[idx] = false;
                 window_counts[idx] = 0.0;
             }
 
+            //past the end of the genome we only evict, never insert
+            if i >= len {
+                continue;
+            }
+
+            //update with new values
+            let mut maf = freqs[j];
+
+            //fill in 0s with poisson distribution if maf == 0 (lambda == 0 implies an imputed count of 0)
+            if maf == 0.0 {
+                if let Some(ref poisson) = poisson {
+                    let imputed_count: f64 = poisson.sample(&mut rng).min(min_kmers as f64);
+                    maf = imputed_count / total_depth as f64; // impute the count
+                }
+            }
+
+            n += 1;
+            s += maf;
+            s2 += maf * maf;
+
+            //loop through max table from bottom and update
+            for k in (0..max_table_len).rev() {
+                if maf > maxes[k].0 {
+                    if k + 1 < max_table_len {
+                        maxes[k + 1] = maxes[k];
+                    }
+                    maxes[k] = (maf, idx);
+                } else {
+                    break;
+                }
+            }
+
             window_counts[idx] = maf;
+            occupied[idx] = true;
 
         }
 
-        //update mu and var
+        //update mu and var (clamped, floating point cancellation can push the variance below zero)
         if n != 0 {
             mu = s / n as f64;
-            var = (s2 / n as f64) - mu * mu;
+            var = ((s2 / n as f64) - mu * mu).max(0.0);
         } else {
             mu = 0.0;
             var = 0.0;
@@ -1761,9 +1831,9 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
         let mut curr_mu = mu;
         let mut curr_var = var;
 
-        while curr_max_idx < max_table_len && maxes[curr_max_idx] != 0.0 {
+        while curr_max_idx < max_table_len && maxes[curr_max_idx].1 != usize::MAX {
             //calculate t from thompson tau test
-            let candidate_outlier = maxes[curr_max_idx];
+            let candidate_outlier = maxes[curr_max_idx].0;
             let std = curr_var.sqrt();
 
             let tau = if curr_n > 2 {
@@ -1778,13 +1848,13 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             // see if current max - mu is greater than t - sqrt(var)
             // if so, adjust temp n, s, s2, then recalculate mu and var and go to next max. 
             // if not, set the baseline noise at i to curr_mu, curr_var, curr_max
-            if (candidate_outlier as f64 - curr_mu).abs() > tau * std {
+            if (candidate_outlier - curr_mu).abs() > tau * std {
                 curr_s -= candidate_outlier;
                 curr_s2 -=  candidate_outlier * candidate_outlier;
                 curr_n -= 1;
                 if curr_n > 0 {
-                    curr_mu = curr_s as f64 / curr_n as f64;
-                    curr_var = (curr_s2 as f64 / curr_n as f64) - curr_mu * curr_mu;
+                    curr_mu = curr_s / curr_n as f64;
+                    curr_var = ((curr_s2 / curr_n as f64) - curr_mu * curr_mu).max(0.0);
                 } else {
                     curr_mu = 0.0;
                     curr_var = 0.0;
@@ -1801,7 +1871,7 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             let write_idx = i - half_window;
             if write_idx < len {
                 baseline_noise[write_idx] = Noise{
-                    max: maxes.get(curr_max_idx).copied().unwrap_or(0.0),
+                    max: maxes.get(curr_max_idx).map(|&(v, _)| v).unwrap_or(0.0),
                     mean: curr_mu,
                     std: curr_var.sqrt()
                 };
@@ -1909,7 +1979,7 @@ pub fn call_variants(
         let fwd_counts = output_count.get(seq).expect("Missing fwd counts");
         let rev_counts = output_rev_count.get(seq).expect("Missing rev counts");
 
-        let baseline_noise: Vec<Noise> = get_baseline_noise(&*fwd, &*rev);
+        let baseline_noise: Vec<Noise> = get_baseline_noise(&*fwd, &*rev, args.sequencing_error_rate, args.min_kmers);
 
         let len = fwd.counts.len();
         let mut start = 0;
