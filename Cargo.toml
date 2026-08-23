@@ -31,6 +31,8 @@ rustc-hash = "2.1.1"
 dashmap = "6.1.0"
 bincode = "2.0.1"
 statrs = "0.18.0"
+rand_distr = "0.6.0"
+rand = "0.10.2"
 
 [dev-dependencies]
 assert_cmd = "2.0"
