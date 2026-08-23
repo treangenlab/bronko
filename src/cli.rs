@@ -149,6 +149,9 @@ pub struct CallArgs {
     #[clap(long="noise-multiplier", default_value_t = DEFAULT_NOISE_MULTIPLIER, help_heading = "VARIANT CALLING PARAMETERS", help="How much greater (1x, 1.5x, etc) the minor allele frequency of a variant must be above estimated baseline noise in that region (must be > 1.0x). Note that for variants under 1%, multiplier will be increased exponentially up to +0.5 more")]
     pub variant_multiplier: f64,
 
+    #[clap(long="sequeuncing-error-rate", default_value_t = DEFAULT_SEQUENCING_ERROR_RATE, help_heading="VARIANT CALLING PARAMETERS", help="Estimated sequencing error rate (used to help impute baseline noise for variant calling)")]
+    pub sequencing_error_rate: f64,
+
     //INDEL PARAMETERS
     //enable indel reconstruction (consensus will contain indels)
     #[clap(long="indels", default_value_t = DEFAULT_INDEL_DETECTION, help_heading="INDEL DETECTION", help="Enable indel detection and reconstruction (the consensus sequence will contain indels)")]

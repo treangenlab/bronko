@@ -18,7 +18,6 @@ use std::vec;
 use std::fs;
 
 use rayon::prelude::*;
-use rayon::join;
 
 use std::path::{Path};
 use std::io::{BufReader, BufRead, BufWriter, Write};
@@ -26,6 +25,8 @@ use std::process::{Command, Stdio};
 use std::cmp::max;
 
 use statrs::distribution::{StudentsT, ContinuousCDF};
+use rand_distr::{Distribution, Poisson};
+
 
 fn check_args(args: &CallArgs) {
     let output_level;
@@ -152,6 +153,16 @@ fn check_args(args: &CallArgs) {
 
     if args.min_variant_depth < 0 {
         warn!("Minimum variant depth set below 0, all variants will be returned if passing other thresholds");
+    }
+
+    if args.sequencing_error_rate < 0.0 {
+        error!("Sequencing error rate is set to below 0, must be between 0.0 and 1.0");
+        std::process::exit(1);
+    } else if args.sequencing_error_rate > 1.0 {
+        error!("Sequencing error rate is set above 1, must be between 0.0 and 1.0");
+        std::process::exit(1);
+    } else if args.sequencing_error_rate >= 0.05 {
+        warn!("Sequencing error rate is set to above 5%, please verify this is correct (default is 0.5%)");
     }
 
     if args.min_depth < 0 {
@@ -367,7 +378,7 @@ pub fn call(args: CallArgs) {
             info!("Processing {}", se_read);
 
             //Get kmer counts
-            let (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer ) = get_kmers(&se_read, &args.threads, &args);
+            let (kmers, total_reads, total_kmers, unique_kmers, unique_counted_kmer ) = get_kmers(&se_read, None, &args.threads, &args);
             info!("{} reads counted from {}", total_reads, se_read);
             info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers (~{} basepairs)", unique_counted_kmer, args.min_kmers, unique_kmers, total_kmers, total_kmers*args.kmer);
             log_memory_usage(true, "Finished counting kmers");
@@ -654,15 +665,10 @@ pub fn call(args: CallArgs) {
         for (r1, r2) in pe_seq_datasets1.iter().zip(pe_seq_datasets2.iter()){
             info!("Processing paired reads {}, {}", r1, r2);
 
-            let half_threads = &args.threads / 2;
-            let ((kmers1, total_reads_r1, total_kmers_r1, unique_kmers_r1, unique_counted_kmer_r1),
-                 (kmers2, total_reads_r2, total_kmers_r2, unique_kmers_r2, unique_counted_kmer_r2)) =
-                join(
-                    || get_kmers(r1, &half_threads, &args),
-                    || get_kmers(r2, &half_threads, &args),
-                );
-            info!("{} reads counted from {}", total_reads_r1 + total_reads_r2, r1);
-            info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers (~{} basepairs)", unique_counted_kmer_r1 + unique_counted_kmer_r2, args.min_kmers, unique_kmers_r1 + unique_kmers_r2, total_kmers_r1 + total_kmers_r2, (total_kmers_r1 + total_kmers_r2) * args.kmer);
+            let (kmers_pe, total_reads, total_kmers, unique_kmers, unique_counted_kmer) =
+                get_kmers(r1, Some(r2), &args.threads, &args);
+            info!("{} reads counted from {}, {}", total_reads, r1, r2);
+            info!("{} unique kmers above {} count, {} total unique kmers, {} total kmers (~{} basepairs)", unique_counted_kmer, args.min_kmers, unique_kmers, total_kmers, total_kmers * args.kmer);
             log_memory_usage(true, "Finished counting kmers");
 
             //initialize output storage and then map the kmers using the index
@@ -670,31 +676,26 @@ pub fn call(args: CallArgs) {
             let output_maps = initialize_output_maps(&viral_metadata);
             info!("Mapping kmers to all genomes");
             let flanking_base_map: DashMap<u64, [[u64; 4]; 2]> = DashMap::new();
-            let mapping_data_r1 = map_kmers(&kmers1, &ref_index, &viral_metadata, &half_threads, &args, &output_maps, &flanking_base_map);
-            let mapping_data_r2 = map_kmers(&kmers2, &ref_index, &viral_metadata, &half_threads, &args, &output_maps, &flanking_base_map);
+            let mapping_data = map_kmers(&kmers_pe, &ref_index, &viral_metadata, &args.threads, &args, &output_maps, &flanking_base_map);
             trace!("Collected flanking base counts for {} buckets", flanking_base_map.len());
 
             info!("Selecting the most representative genome");
-            let best_genome_index = pick_best_genome_paired(&mapping_data_r1, &mapping_data_r2, &viral_metadata).unwrap_or_else(|| {
+            let best_genome_index = pick_best_genome(&mapping_data, &viral_metadata).unwrap_or_else(|| {
                 error!("Unable to pick a best genome");
                 std::process::exit(1);
             });
 
-            let (n_perfect_mapped_r1, n_variant_mapped_r1, n_unique_perfect_r1) = mapping_data_r1.get(&best_genome_index).unwrap_or_else(|| {
+            let (n_perfect_mapped, n_variant_mapped, n_unique_perfect) = mapping_data.get(&best_genome_index).unwrap_or_else(|| {
                 error!("Error getting mapping statistics for best genome");
                 std::process::exit(1);
             });
-            let (n_perfect_mapped_r2, n_variant_mapped_r2, n_unique_perfect_r2) = mapping_data_r2.get(&best_genome_index).unwrap_or_else(|| {
-                error!("Error getting mapping statistics for best genome");
-                std::process::exit(1);
-            });
-            
+
             let best_genome_filename = &viral_metadata.files[best_genome_index as usize].name;
             info!("Selected a representative genome: {}", best_genome_filename);
-            let n_unmapped_kmers = (unique_counted_kmer_r1 + unique_counted_kmer_r2)-(n_perfect_mapped_r1+n_perfect_mapped_r2)-(n_variant_mapped_r1 + n_variant_mapped_r2);
-            let message = format!("Mapped {}/{} kmers perfectly ({} unique among references) , {}/{} had a variant, {} unmapped", n_perfect_mapped_r1 + n_perfect_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_unique_perfect_r1 + n_unique_perfect_r2, n_variant_mapped_r1+n_variant_mapped_r2, unique_counted_kmer_r1 + unique_counted_kmer_r2, n_unmapped_kmers); 
+            let n_unmapped_kmers = unique_counted_kmer - n_perfect_mapped - n_variant_mapped;
+            let message = format!("Mapped {}/{} kmers perfectly ({} unique among references) , {}/{} had a variant, {} unmapped", n_perfect_mapped, unique_counted_kmer, n_unique_perfect, n_variant_mapped, unique_counted_kmer, n_unmapped_kmers);
             log_memory_usage(true, &message);
-            if ((n_variant_mapped_r1 + n_variant_mapped_r2 + n_perfect_mapped_r1 + n_perfect_mapped_r2) as f64 / ((unique_counted_kmer_r1 as f64) + (unique_counted_kmer_r2 as f64))) < 0.2 {
+            if ((n_variant_mapped + n_perfect_mapped) as f64 / (unique_counted_kmer as f64)) < 0.2 {
                 warn!("Percent of kmers found is very low, suggesting a bad reference, a bad sequencing run, contamination in sample, or some other issue")
             }
 
@@ -781,12 +782,9 @@ pub fn call(args: CallArgs) {
 
                 // flanking base counts aren't needed here, so the pass-1 map is reused as a throwaway sink.
                 let new_output_maps = initialize_output_maps(&new_meta);
-                let new_mapping_data_r1 = map_kmers(&kmers1, &new_index, &new_meta, &half_threads, &args, &new_output_maps, &flanking_base_map);
-                let new_mapping_data_r2 = map_kmers(&kmers2, &new_index, &new_meta, &half_threads, &args, &new_output_maps, &flanking_base_map);
-                let (p1, v1, _) = new_mapping_data_r1.get(&0).copied().unwrap_or((0, 0, 0));
-                let (p2, v2, _) = new_mapping_data_r2.get(&0).copied().unwrap_or((0, 0, 0));
-                let (new_perfect, new_variant) = (p1 + p2, v1 + v2);
-                info!("Re-mapped kmers onto corrected consensus: {}/{} perfect, {} variant", new_perfect, unique_counted_kmer_r1 + unique_counted_kmer_r2, new_variant);
+                let new_mapping_data = map_kmers(&kmers_pe, &new_index, &new_meta, &args.threads, &args, &new_output_maps, &flanking_base_map);
+                let (new_perfect, new_variant, _) = new_mapping_data.get(&0).copied().unwrap_or((0, 0, 0));
+                info!("Re-mapped kmers onto corrected consensus: {}/{} perfect, {} variant", new_perfect, unique_counted_kmer, new_variant);
 
                 // map each corrected coordinate back to the original reference (positions inside a spliced
                 // indel allele have no original coordinate and are skipped during calling)
@@ -923,8 +921,8 @@ pub fn call(args: CallArgs) {
             // kmer mapping statistics: use the corrected second pass when indels were applied, else the
             // first pass against the selected genome
             let (out_perfect_kmers, out_variant_kmers, out_unmapped_kmers) = match &second_pass {
-                Some((.., (p, v))) => (*p, *v, (unique_counted_kmer_r1 + unique_counted_kmer_r2).saturating_sub(*p + *v)),
-                None => (*n_perfect_mapped_r1 + *n_perfect_mapped_r2, *n_variant_mapped_r1 + *n_variant_mapped_r2, n_unmapped_kmers),
+                Some((.., (p, v))) => (*p, *v, unique_counted_kmer.saturating_sub(*p + *v)),
+                None => (*n_perfect_mapped, *n_variant_mapped, n_unmapped_kmers),
             };
 
             output_info.push(OutputInfo {
@@ -1017,62 +1015,6 @@ pub fn pick_best_genome(mapping_data: &FxHashMap<u16, (usize, usize, usize)>, vi
 
     if best_score == 0.0 {
         warn!("No genome had any unique kmers, suggesting sequencing depth below --min-kmers or some other issue")
-    }
-
-    best_genome
-}
-
-pub fn pick_best_genome_paired(
-    mapping_data1: &FxHashMap<u16, (usize, usize, usize)>,
-    mapping_data2: &FxHashMap<u16, (usize, usize, usize)>,
-    viral_metadata: &ViralMetadata,
-) -> Option<u16> {
-    let mut combined: FxHashMap<u16, (usize, usize, usize)> = FxHashMap::default();
-
-    // Combine both mapping datasets
-    for (&k, (p, v, u)) in mapping_data1.iter() {
-        combined.insert(k, (*p, *v, *u));
-    }
-
-    // Add everything from mapping_data2
-    for (&k, (p, v, u)) in mapping_data2.iter() {
-        combined
-            .entry(k)
-            .and_modify(|(cp, cv, cu)| {
-                *cp += p;
-                *cv += v;
-                *cu += u;
-            })
-            .or_insert((*p, *v, *u));
-    }
-
-    //get best genome just like for single end reads
-    let mut best_genome: Option<u16> = None;
-    let mut best_score: f64 = f64::NEG_INFINITY;
-
-    for (file_index, (perfect, variant, unique_perfect)) in combined.iter() {
-        let genome_len: usize = viral_metadata.files[*file_index as usize]
-            .sequences
-            .iter()
-            .map(|s| s.len)
-            .sum();
-
-        let score = (*perfect as f64) / (genome_len as f64) / 2.0; //divided by 2.0 bc of fwd and reverse
-
-        let genome_name: String = viral_metadata.files[*file_index as usize].name.clone();
-        trace!(
-            "Genome {} (paired): perfect={}, variant={}, unique_perfect={}, len={}, score={:.4}",
-            genome_name, perfect, variant, unique_perfect, genome_len, score
-        );
-
-        if score > best_score {
-            best_score = score;
-            best_genome = Some(*file_index);
-        }
-    }
-
-    if best_score == 0.0 {
-        warn!("No genome had any unique kmers, suggesting sequencing depth is below --min-kmers or some other issue")
     }
 
     best_genome
@@ -1205,9 +1147,9 @@ pub fn build_alignment_fasta(
 
 }
 
-pub fn get_kmers(reads_file: &String, threads: &usize, args:&CallArgs) -> (Vec<(String, u64)>, usize, usize, usize, usize){
+pub fn get_kmers(reads_file: &String, reads_file2: Option<&String>, threads: &usize, args:&CallArgs) -> (Vec<(String, u64)>, usize, usize, usize, usize){
     //count kmers using kmc3
-    let kmc_result = count_kmers_kmc(&reads_file, &threads, &args);
+    let kmc_result = count_kmers_kmc(&reads_file, reads_file2, &threads, &args);
     let (total_reads, total_kmers, unique_kmers, unique_counted_kmer) = match kmc_result {
         Ok(values) => values,
         Err(err_msg) => {
@@ -1643,7 +1585,7 @@ pub struct Noise{
 }
 
 
-pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
+pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData, sequencing_error: f64, min_kmers: usize) -> Vec<Noise> {
 
     //window size and alppa, max table size for our streaming version of thompson tau
     let window_size = 100;
@@ -1656,11 +1598,12 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
     let mut baseline_noise = vec![Noise {max: 0.0, mean: 0.0, std: 0.0}; len];
 
     //storing the counts in the window (since max 3 alternative nucleotides the length is 3 * window length, which we can index based off of genome_pos % window_size)
-    //we also keep in_max which is 0 or 1 depending on if it is in the max table
-    let mut window_counts = vec![0.0; len*3];
-    let mut in_max = vec![0; len*3];
+    //we also keep occupied to know which slots currently hold a value from the window
+    let mut window_counts = vec![0.0; window_size*3];
+    let mut occupied = vec![false; window_size*3];
 
-    let mut maxes = vec![0.0; max_table_len];
+    //max table holds (value, slot idx) so entries are located exactly instead of by float equality
+    let mut maxes: Vec<(f64, usize)> = vec![(0.0, usize::MAX); max_table_len];
 
     let mut n:usize = 0; //number of variant positions in the window (between 0-3*len)
     let mut s:f64 = 0.0; //sum of the variant positions
@@ -1670,26 +1613,75 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
 
     let half_window = window_size / 2;
 
+    let mut rng = rand::rng(); // get rng for poisson generator
+
     for i in 0..(len + half_window) {
 
         let base_pos = (i % window_size) * 3;
         
-        
-        let freqs: Vec<f64> = if i < len {
+        let (counts, freqs, total_depth, major_count, non_zero_count, non_zero_sum) = if i < len {
             // Combine counts across strands
             let mut counts: Vec<u64> = (0..4)
                 .map(|b| fwd.counts[i][b] + rev.counts[i][b])
                 .collect();
+
+            // Sort major to minor
             counts.sort_unstable_by(|a, b| b.cmp(a));
-            let total_depth: u64 = counts.iter().sum();
-            if total_depth == 0 {
+
+            let total_depth: u64 = counts.iter().sum(); //total depth at position
+
+            let freqs: Vec<f64> = if total_depth == 0 { // get the frequencies
                 vec![0.0; 4]
             } else {
-                counts.iter().map(|&c| c as f64 / total_depth as f64).collect()
-            }
+                counts
+                    .iter()
+                    .map(|&c| c as f64 / total_depth as f64)
+                    .collect()
+            };
+
+            let major_count = counts[0]; //the major allele at that position
+
+            let non_zero_count = counts[1..] //get non-zero counts and sum for imputation of missing values
+                .iter()
+                .filter(|&&c| c > 0)
+                .count();
+
+            let non_zero_sum: u64 = counts[1..]
+                .iter()
+                .filter(|&&c| c > 0)
+                .sum();
+
+            (counts, freqs, total_depth, major_count, non_zero_count, non_zero_sum)
         } else {
-            vec![0.0; 4]
+            (vec![0; 4], vec![0.0; 4], 0, 0, 0, 0)
         };
+
+        //Get the expected error rate and lambda if there are zeros as minor alleles
+        let lambda = {
+            let total_expected_error = sequencing_error * major_count as f64;
+            let expected_per_minor: f64 = total_expected_error / 3.0; //divide by 3 for the 3 minor alleles
+
+            let observed_excess =
+                (non_zero_sum as f64 - non_zero_count as f64 * expected_per_minor).max(0.0);
+
+            let remaining_error =
+                (total_expected_error - observed_excess).max(0.0);
+
+            let n_zero = 3 - non_zero_count;
+
+            if n_zero > 0 {
+                remaining_error / n_zero as f64
+            } else {
+                0.0
+            }
+        };
+
+        let poisson = if lambda > 0.0 {
+            Some(Poisson::new(lambda).unwrap())
+        } else {
+            None
+        };
+
 
         //loop through minor variants for that position and update n, s, s2
         for j in 1..4 {
@@ -1697,57 +1689,65 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             let idx = base_pos + (j - 1);
 
             //remove the old values
-            let old = window_counts[idx];
-            if old > 0.0 {
+            if occupied[idx] {
+                let old = window_counts[idx];
                 n -= 1;
                 s -= old;
                 s2 -= old * old;
 
-                //remove from max if there
-                if in_max[idx] == 1 {
-                    //remove from maxes table and shift others up
-                    if let Some(pos) = maxes.iter().position(|&x| (x - old).abs() < 1e-12) {
-                        for k in pos..(max_table_len - 1) {
-                            maxes[k] = maxes[k+1];
-                        }
-                        maxes[max_table_len - 1] = 0.0;
+                //remove from maxes table if there and shift others up
+                if let Some(pos) = maxes.iter().position(|&(_, m)| m == idx) {
+                    for k in pos..(max_table_len - 1) {
+                        maxes[k] = maxes[k+1];
                     }
-                    in_max[idx] = 0;
+                    maxes[max_table_len - 1] = (0.0, usize::MAX);
                 }
-            }
 
-            //update with new values
-            let maf = freqs[j];
-            if maf > 0.0 {
-                n += 1;
-                s += maf;
-                s2 += maf * maf;
-
-                //loop through max table from bottom and update
-                for k in (0..max_table_len).rev() {
-                    if maf > maxes[k] {
-                        if k + 1 < max_table_len {
-                            maxes[k + 1] = maxes[k];
-                        }
-                        maxes[k] = maf;
-                    } else {
-                        break;
-                    }
-                }
-                in_max[idx] = 1;
-            } else {
-                in_max[idx] = 0;
+                occupied[idx] = false;
                 window_counts[idx] = 0.0;
             }
 
+            //past the end of the genome we only evict, never insert
+            if i >= len {
+                continue;
+            }
+
+            //update with new values
+            let mut maf = freqs[j];
+
+            //fill in 0s with poisson distribution if maf == 0 (lambda == 0 implies an imputed count of 0)
+            if maf == 0.0 {
+                if let Some(ref poisson) = poisson {
+                    let imputed_count: f64 = poisson.sample(&mut rng).min(min_kmers as f64);
+                    maf = imputed_count / total_depth as f64; // impute the count
+                }
+            }
+
+            n += 1;
+            s += maf;
+            s2 += maf * maf;
+
+            //loop through max table from bottom and update
+            for k in (0..max_table_len).rev() {
+                if maf > maxes[k].0 {
+                    if k + 1 < max_table_len {
+                        maxes[k + 1] = maxes[k];
+                    }
+                    maxes[k] = (maf, idx);
+                } else {
+                    break;
+                }
+            }
+
             window_counts[idx] = maf;
+            occupied[idx] = true;
 
         }
 
-        //update mu and var
+        //update mu and var (clamped, floating point cancellation can push the variance below zero)
         if n != 0 {
             mu = s / n as f64;
-            var = (s2 / n as f64) - mu * mu;
+            var = ((s2 / n as f64) - mu * mu).max(0.0);
         } else {
             mu = 0.0;
             var = 0.0;
@@ -1761,9 +1761,9 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
         let mut curr_mu = mu;
         let mut curr_var = var;
 
-        while curr_max_idx < max_table_len && maxes[curr_max_idx] != 0.0 {
+        while curr_max_idx < max_table_len && maxes[curr_max_idx].1 != usize::MAX {
             //calculate t from thompson tau test
-            let candidate_outlier = maxes[curr_max_idx];
+            let candidate_outlier = maxes[curr_max_idx].0;
             let std = curr_var.sqrt();
 
             let tau = if curr_n > 2 {
@@ -1778,13 +1778,13 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             // see if current max - mu is greater than t - sqrt(var)
             // if so, adjust temp n, s, s2, then recalculate mu and var and go to next max. 
             // if not, set the baseline noise at i to curr_mu, curr_var, curr_max
-            if (candidate_outlier as f64 - curr_mu).abs() > tau * std {
+            if (candidate_outlier - curr_mu).abs() > tau * std {
                 curr_s -= candidate_outlier;
                 curr_s2 -=  candidate_outlier * candidate_outlier;
                 curr_n -= 1;
                 if curr_n > 0 {
-                    curr_mu = curr_s as f64 / curr_n as f64;
-                    curr_var = (curr_s2 as f64 / curr_n as f64) - curr_mu * curr_mu;
+                    curr_mu = curr_s / curr_n as f64;
+                    curr_var = ((curr_s2 / curr_n as f64) - curr_mu * curr_mu).max(0.0);
                 } else {
                     curr_mu = 0.0;
                     curr_var = 0.0;
@@ -1801,7 +1801,7 @@ pub fn get_baseline_noise(fwd: &OutputData, rev: &OutputData) -> Vec<Noise> {
             let write_idx = i - half_window;
             if write_idx < len {
                 baseline_noise[write_idx] = Noise{
-                    max: maxes.get(curr_max_idx).copied().unwrap_or(0.0),
+                    max: maxes.get(curr_max_idx).map(|&(v, _)| v).unwrap_or(0.0),
                     mean: curr_mu,
                     std: curr_var.sqrt()
                 };
@@ -1909,7 +1909,7 @@ pub fn call_variants(
         let fwd_counts = output_count.get(seq).expect("Missing fwd counts");
         let rev_counts = output_rev_count.get(seq).expect("Missing rev counts");
 
-        let baseline_noise: Vec<Noise> = get_baseline_noise(&*fwd, &*rev);
+        let baseline_noise: Vec<Noise> = get_baseline_noise(&*fwd, &*rev, args.sequencing_error_rate, args.min_kmers);
 
         let len = fwd.counts.len();
         let mut start = 0;
@@ -2085,10 +2085,9 @@ pub fn call_variants(
 
 }
 
-pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Result<(usize, usize, usize, usize), String> {
+pub fn count_kmers_kmc(reads: &String, reads2: Option<&String>, threads: &usize, args: &CallArgs) -> Result<(usize, usize, usize, usize), String> {
     let fastq_path = reads.clone();
     let file_stem = clean_sample_id(&fastq_path);
-
 
     let output_dir = Path::new(&args.output);
     let tmp_dir = output_dir.join(format!("tmp_{}", file_stem));
@@ -2102,6 +2101,21 @@ pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Resu
     fs::create_dir_all(output_dir)
         .map_err(|e| format!("Failed to create output dir: {}", e))?;
 
+    // with a second read file, list both mates for kmc so k-mers are counted jointly across the
+    // pair (a kmer shared by both mates gets one combined-count entry) instead of independently
+    // per mate, which is what lets depth/support be combined correctly downstream
+    let samples_path = output_dir.join("samples.txt");
+    let input_arg = if let Some(r2) = reads2 {
+        let mut samples_file = File::create(&samples_path)
+            .map_err(|e| format!("Failed to create samples list: {}", e))?;
+        writeln!(samples_file, "{}", fastq_path)
+            .and_then(|_| writeln!(samples_file, "{}", r2))
+            .map_err(|e| format!("Failed to write samples list: {}", e))?;
+        format!("@{}", samples_path.to_str().unwrap())
+    } else {
+        fastq_path.clone()
+    };
+
     let res_prefix = format!("{}/{}.res", args.output, file_stem);
     let kmc_output = Command::new("kmc")
         .args(&[
@@ -2111,7 +2125,7 @@ pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Resu
             "-b",
             &format!("-ci{}", args.min_kmers),
             "-cs1000000",
-            &format!("{}", fastq_path),
+            &input_arg,
             &res_prefix,
             tmp_dir.to_str().unwrap(),
         ])
@@ -2119,6 +2133,12 @@ pub fn count_kmers_kmc(reads: &String, threads: &usize, args: &CallArgs) -> Resu
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| format!("KMC3 failed: {}", e))?;
+
+    if reads2.is_some() {
+        if let Err(e) = fs::remove_file(&samples_path) {
+            warn!("Failed to remove samples list {}: {}", samples_path.display(), e);
+        }
+    }
 
     if !kmc_output.status.success() {
         let stderr = String::from_utf8_lossy(&kmc_output.stderr);
