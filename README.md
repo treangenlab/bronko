@@ -15,15 +15,16 @@
 
 bronko also allows users to run multiple samples of the same strain/species and build a multiple sequence alignment that can be inputted directly into phylogenetics software
 
+> [!IMPORTANT]
+> bronko can now call indels as of v0.1.4! Please note that this aspect of the software is still in early stages
+> (please let me know if you find any bugs). To enable use the `--indels` flag when running `bronko call`
+> Additional documentation is available in the wiki.  
+
 ### Why use bronko over existing viral variant callers?
 1. **Simplicity** -- bronko bypasses most steps of typical variant calling (indexing, read mapping, sam manipulation, variant calling, alignment, etc) and packages everything into 1-2 commands
 2. **Large Scale Capability** -- bronko allows you to test hundreds of strains against hundreds of samples simultaneously, allowing you to variant call diverse samples with diverse reference genomes
 3. **Consistently ultrafast** -- bronko is between 10-1000x faster than existing pipelines for read mapping (bowtie2, ie) and then variant calling (lofreq, ivar, ie), depending on the sequencing depth / number of reads as well as the number of threads available
 4. **Comparable precision and sensitivity** -- On our benchmarks so far, bronko achieves reasonable consistency with both ivar and lofreq on variant calling for both SNPs and iSNVs, and generates multiple sequence alignments that are consistent with core-genome alignment software (Parsnp2).
-
-> [!IMPORTANT]
-> New feature in v0.1.4: bronko can now call indels! Please note that this aspect of the software is still in early stages (please let me know if you find any bugs). To enable use the `--indels` flag when running `bronko call`
-> Additional documentation is available in the wiki.  
 
 ### How does bronko work
 bronko bypasses readmapping by directly mapping kmers with small edit distance to a pileup representing the forward and reverse strands. It then uses the depth information and number of kmers mapping to each position/base to perform variant calling, similarly to existing tools. The lack of a formal pileup makes the process much more efficient, and thus we are able to achieve similar results in a fraction of the time.  
