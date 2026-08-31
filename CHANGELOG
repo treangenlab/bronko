@@ -2,6 +2,11 @@
 
 All major changes to bronko will be documented in this file
 
+
+## [v0.1.7] - 08/31/2026
+- Added additional reporting metrics into VCF file regarding strand bias (STR_BAL for strand disbalance). 
+- Added parameters for variant calling into VCF file
+
 ## [v0.1.6] - 08/23/2026
 
 - Introduced SOR_adj, which takes the SOR score and subtracts a score that increases as the minor allele has more supporting reads and is futher above the baseline noise for that window. --sor-adj-multiplier controls the strength of this adjustment.
