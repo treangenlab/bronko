@@ -1341,6 +1341,19 @@ pub fn print_output(
     writeln!(writer, "##source=bronko-v{}", BRONKO_VERSION).unwrap();
     writeln!(writer, "##reference=file://{}", read_output).unwrap(); // update to reflect current genome
 
+    writeln!(writer, "##bronko_param_min_af={}", args.min_af).unwrap();
+    writeln!(writer, "##bronko_param_no_end_filter={}", args.no_end_filter).unwrap();
+    writeln!(writer, "##bronko_param_no_strand_filter={}", args.no_strand_filter).unwrap();
+    writeln!(writer, "##bronko_param_no_strand_balance_filter={}", args.no_strand_balance_filter).unwrap();
+    writeln!(writer, "##bronko_param_balance_ratio={}", args.strand_balance_ratio).unwrap();
+    writeln!(writer, "##bronko_param_n_per_strand={}", args.n_per_strand).unwrap();
+    writeln!(writer, "##bronko_param_strand_odds={}", args.strand_odds_max).unwrap();
+    writeln!(writer, "##bronko_param_sor_adj_multiplier={}", args.sor_adj_multiplier).unwrap();
+    writeln!(writer, "##bronko_param_min_depth={}", args.min_depth).unwrap();
+    writeln!(writer, "##bronko_param_min_variant_depth={}", args.min_variant_depth).unwrap();
+    writeln!(writer, "##bronko_param_noise_multiplier={}", args.variant_multiplier).unwrap();
+    writeln!(writer, "##bronko_param_sequencing_error_rate={}", args.sequencing_error_rate).unwrap();
+
     let file_meta = &viral_metadata.files[*best_genome_index as usize];
 
     for seq_entry in &file_meta.sequences {
@@ -1353,6 +1366,7 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=DP4,Number=4,Type=Integer,Description=\"Fwd_ref,Rev_ref,Fwd_alt,Rev_alt\">").unwrap();
     writeln!(writer, "##INFO=<ID=SOR,Number=1,Type=Float,Description=\"SOR\">").unwrap();
     writeln!(writer, "##INFO=<ID=SOR_ADJ,Number=1,Type=Float,Description=\"SOR discounted by read support and distance from the noise floor\">").unwrap();
+    writeln!(writer, "##INFO=<ID=STR_BAL,Number=1,Type=Float,Description=\"Fraction of ref+alt depth held by the minority strand\">").unwrap();
     writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, INS, DEL)\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
@@ -1373,7 +1387,7 @@ pub fn print_output(
 
     for variant in sorted{
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
-        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};SOR_ADJ={:.3};TYPE={}",
+        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};SOR_ADJ={:.3};STR_BAL={:.3};TYPE={}",
             seq_out,
             variant.pos,
             String::from_utf8_lossy(&variant.ref_allele),
@@ -1383,6 +1397,7 @@ pub fn print_output(
             variant.fwd_ref, variant.rev_ref, variant.fwd_alt, variant.rev_alt,
             variant.sor,
             variant.sor_adjusted,
+            variant.strand_balance(),
             variant.var_type()
         ).unwrap()
     }
@@ -1401,7 +1416,7 @@ pub struct VCFRecord{
     depth: u64,
     af: f64,
     sor: f64,
-    sor_adjusted: f64 // SOR after its evidence discount, the value tested against the cutoff (-1.0 where no strand test runs)
+    sor_adjusted: f64 // SOR after its evidence discount, floored at 0
 }
 
 impl VCFRecord {
@@ -1414,6 +1429,16 @@ impl VCFRecord {
             (r, a) if a > r => "INS",
             _ => "DEL",
         }
+    }
+
+    // fraction of ref+alt depth held by the minority strand (same pseudocount formula used for the
+    // strand-balance bypass check in call_variants)
+    fn strand_balance(&self) -> f64 {
+        let a = self.fwd_ref as f64 + 1.0;
+        let b = self.rev_ref as f64 + 1.0;
+        let c = self.fwd_alt as f64 + 1.0;
+        let d = self.rev_alt as f64 + 1.0;
+        (a + c).min(b + d) / (a + b + c + d)
     }
 }
 
@@ -1531,7 +1556,7 @@ fn indel_to_vcf_record(
         depth,
         af,
         sor,
-        sor_adjusted: -1.0, // indels are not strand filtered
+        sor_adjusted: sor.max(0.0), // indels are not strand filtered; no evidence discount applies
     })
 }
 
@@ -1871,7 +1896,7 @@ fn major_snv_second_pass_record(
         depth: total_depth,
         af,
         sor,
-        sor_adjusted: -1.0, // major variants are not strand filtered
+        sor_adjusted: sor.max(0.0), // major variants are not strand filtered; no evidence discount applies
     })
 }
 
@@ -1995,28 +2020,29 @@ pub fn call_variants(
                     sor_discount = (args.sor_adj_multiplier * support * above_noise).min(args.strand_odds_max);
                 }
 
-                // NEW Strand filter logic
-                let mut sor = args.strand_odds_max + 1.0; //default is above the given so filtered if not able to calculate
-                let mut sor_adjusted = sor;
-                if strand_filter {
+                // Strand metrics (SOR, SOR_ADJ, strand balance) are always computed and reported,
+                // regardless of whether the strand filters below are enabled.
+                let min_strand_percent = {
                     let a = row[ref_base as usize] as f64 + 1.0; //ref fwd
                     let b = row_rev[ref_base as usize] as f64 + 1.0; //ref rev
                     let c = row[alt_base as usize] as f64 + 1.0; //alt fwd
                     let d = row_rev[alt_base as usize] as f64 + 1.0; //alt rev
-
-                    //calculate the difference between the strands
                     let ref_total = a + b + c + d;
                     let min_strand_depth = (a+c).min(b+d);
-                    let min_strand_percent = min_strand_depth / ref_total;
+                    min_strand_depth / ref_total
+                };
 
+                //Using GATK strand odds ratio
+                let sor = strand_odds_ratio(row[ref_base as usize], row_rev[ref_base as usize], row[alt_base as usize], row_rev[alt_base as usize]);
+                let sor_adjusted = (sor - sor_discount).max(0.0);
+
+                // Existing strand-bias filtering logic, applied only when the respective flags enable it.
+                if strand_filter {
                     //if the strand balance filter is off, then always do SOR filter
                     //if the strand balance filter is on (default), then only do SOR filter when 1 strand is > strand_balance_ratio of total depth (by default 10% of total depth, aka all cases where 1 strand is less than 10% of the total depth are ignored)
-                    if (args.no_strand_balance_filter) | ((!args.no_strand_balance_filter) & (min_strand_percent >= args.strand_balance_ratio)) {
+                    let strand_ok_to_test = args.no_strand_balance_filter || min_strand_percent >= args.strand_balance_ratio;
 
-                        //Using GATK strand odds ratio
-                        sor = strand_odds_ratio(row[ref_base as usize], row_rev[ref_base as usize], row[alt_base as usize], row_rev[alt_base as usize]);
-                        sor_adjusted = sor - sor_discount;
-
+                    if strand_ok_to_test {
                         // filter out if the discounted strand odds ratio is still over the cutoff
                         if sor_adjusted > args.strand_odds_max {
                             continue;
@@ -2029,9 +2055,6 @@ pub fn call_variants(
                         if c_k < n_kmer_per_strand && d_k < n_kmer_per_strand {
                             continue;
                         }
-                    } else {
-                        sor = -1.0; //output SOR == -1.0 if the strand is unbalanced so not tested
-                        sor_adjusted = -1.0;
                     }
                 }
 
@@ -2066,7 +2089,7 @@ pub fn call_variants(
                     depth: total_depth,
                     af: af,
                     sor: sor,
-                    sor_adjusted: if strand_filter { sor_adjusted } else { -1.0 }
+                    sor_adjusted: sor_adjusted
                 })
 
             }

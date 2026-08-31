@@ -130,7 +130,7 @@ pub struct CallArgs {
     #[clap(long="n-per-strand", default_value_t = DEFAULT_N_KMERS_PER_STRAND, help_heading="VARIANT CALLING PARAMETERS", help="Min number of unique kmers to observe to call a variant at any site (needed on both strands if strand filter active)")]
     pub n_per_strand: usize,
 
-    #[clap(long="strand_odds", default_value_t = DEFAULT_MAX_STRAND_ODDS, help_heading="VARIANT CALLING PARAMETERS", help="Maximum strand odds ratio for a variant to pass strand filtering, tested against SOR_adjusted (see --sor-adj-multiplier)")]
+    #[clap(long="strand-odds", default_value_t = DEFAULT_MAX_STRAND_ODDS, help_heading="VARIANT CALLING PARAMETERS", help="Maximum strand odds ratio for a variant to pass strand filtering, tested against SOR_adjusted (see --sor-adj-multiplier)")]
     pub strand_odds_max: f64,
 
     //how fast the allowed strand odds ratio grows with the evidence behind a variant
