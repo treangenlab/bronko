@@ -1367,6 +1367,8 @@ pub fn print_output(
     writeln!(writer, "##INFO=<ID=SOR,Number=1,Type=Float,Description=\"SOR\">").unwrap();
     writeln!(writer, "##INFO=<ID=SOR_ADJ,Number=1,Type=Float,Description=\"SOR discounted by read support and distance from the noise floor\">").unwrap();
     writeln!(writer, "##INFO=<ID=STR_BAL,Number=1,Type=Float,Description=\"Fraction of ref+alt depth held by the minority strand\">").unwrap();
+    writeln!(writer, "##INFO=<ID=ALT_BAL,Number=1,Type=Float,Description=\"Fraction of alt allele depth held by its minority strand (0 if unsupported)\">").unwrap();
+    writeln!(writer, "##INFO=<ID=REF_BAL,Number=1,Type=Float,Description=\"Fraction of ref allele depth held by its minority strand (0 if unsupported)\">").unwrap();
     writeln!(writer, "##INFO=<ID=TYPE,Number=1,Type=String,Description=\"Variant type (SNP, INS, DEL)\">").unwrap();
     writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
 
@@ -1387,7 +1389,7 @@ pub fn print_output(
 
     for variant in sorted{
         let seq_out:&str = variant.seq.split_whitespace().next().unwrap_or("");
-        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};SOR_ADJ={:.3};STR_BAL={:.3};TYPE={}",
+        writeln!(writer, "{}\t{}\t.\t{}\t{}\t.\tPASS\tDP={};AF={:.3};DP4={},{},{},{};SOR={:.3};SOR_ADJ={:.3};STR_BAL={:.3};ALT_BAL={:.3};REF_BAL={:.3};TYPE={}",
             seq_out,
             variant.pos,
             String::from_utf8_lossy(&variant.ref_allele),
@@ -1398,6 +1400,8 @@ pub fn print_output(
             variant.sor,
             variant.sor_adjusted,
             variant.strand_balance(),
+            variant.alt_balance(),
+            variant.ref_balance(),
             variant.var_type()
         ).unwrap()
     }
@@ -1431,6 +1435,25 @@ impl VCFRecord {
         }
     }
 
+    // fraction of the alt allele's depth held by its minority strand (0.5 = perfectly balanced,
+    // 0.0 = single stranded). 0 when the allele has no support at all.
+    fn alt_balance(&self) -> f64 {
+        Self::allele_balance(self.fwd_alt, self.rev_alt)
+    }
+
+    // same for the reference allele
+    fn ref_balance(&self) -> f64 {
+        Self::allele_balance(self.fwd_ref, self.rev_ref)
+    }
+
+    fn allele_balance(fwd: u64, rev: u64) -> f64 {
+        let total = fwd + rev;
+        if total == 0 {
+            return 0.0;
+        }
+        fwd.min(rev) as f64 / total as f64
+    }
+
     // fraction of ref+alt depth held by the minority strand (same pseudocount formula used for the
     // strand-balance bypass check in call_variants)
     fn strand_balance(&self) -> f64 {
@@ -1440,6 +1463,24 @@ impl VCFRecord {
         let d = self.rev_alt as f64 + 1.0;
         (a + c).min(b + d) / (a + b + c + d)
     }
+
+    // fn strand_balance(&self) -> f64 {
+    //     let a = self.fwd_ref as f64 + 1.0;
+    //     let b = self.rev_ref as f64 + 1.0;
+    //     let c = self.fwd_alt as f64 + 1.0;
+    //     let d = self.rev_alt as f64 + 1.0;
+
+    //     let saf = a + c;
+    //     let sar = b + d;
+
+    //     let n = saf + sar; 
+    //     let k = (saf - sar).abs();
+
+    //     let p = 2.0 * (- (k*k) / (2.0 * n)).exp(); // Hoeffding's inequality for the probability of observing a difference of k or more in n trials
+    //     let phred = -10.0 * p.log10(); // convert to Phred
+
+    //     // (a + c).min(b + d) / (a + b + c + d)
+    //     phred
 }
 
 // Build a VCF record for a reconstructed indel. 
